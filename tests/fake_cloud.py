@@ -89,6 +89,11 @@ class FakeCloud:
         path = request.url.path
         self.requests.append((request.method, path))
         auth = request.headers.get("authorization", "")
+        if request.method in ("POST", "PUT"):
+            # Bodies are sent rmapi-style: octet-stream with a CRC32C header (even when empty).
+            expected = "crc32c=" + base64.b64encode(struct.pack(">I", crc32c(request.content))).decode()
+            if request.headers.get("x-goog-hash") != expected:
+                return httpx.Response(400, text="bad or missing x-goog-hash")
 
         if path == "/token/json/2/device/new":
             body = json.loads(request.content)
@@ -125,9 +130,6 @@ class FakeCloud:
     def _put_blob(self, h: str, request: httpx.Request) -> httpx.Response:
         data = request.content
         name = request.headers["rm-filename"]
-        expected = "crc32c=" + base64.b64encode(struct.pack(">I", crc32c(data))).decode()
-        if request.headers.get("x-goog-hash") != expected:
-            return httpx.Response(400, text="bad x-goog-hash")
         if name == "root.docSchema":
             schema, entries = parse_index(data)
             lines = data.decode().split("\n")
@@ -160,6 +162,8 @@ class FakeCloud:
         return httpx.Response(200)
 
     def _put_root(self, request: httpx.Request) -> httpx.Response:
+        if request.headers.get("rm-filename") != "roothash":
+            return httpx.Response(400, text="missing rm-filename")
         body = json.loads(request.content)
         if self.fail_next_root_puts:
             self.fail_next_root_puts -= 1

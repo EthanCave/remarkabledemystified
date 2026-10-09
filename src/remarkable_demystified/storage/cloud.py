@@ -97,6 +97,16 @@ def goog_hash(data: bytes) -> str:
     return "crc32c=" + base64.b64encode(struct.pack(">I", crc32c(data))).decode()
 
 
+def json_body(obj: Any) -> tuple[bytes, dict[str, str]]:
+    """Encode a request body exactly like rmapi (known to work against the live service).
+
+    rmapi sends JSON as raw bytes: compact, ``application/octet-stream``, with an
+    ``x-goog-hash`` CRC32C header, including empty bodies.
+    """
+    data = b"" if obj is None else json.dumps(obj, separators=(",", ":")).encode()
+    return data, {"content-type": "application/octet-stream", "x-goog-hash": goog_hash(data)}
+
+
 # ---------------------------------------------------------------------------
 # Index files
 # ---------------------------------------------------------------------------
@@ -197,11 +207,12 @@ class CloudAuth:
         if len(code) != 8:
             raise AuthError(f"one-time codes are 8 characters; get one at {CONNECT_URL}")
         device_id = str(uuid.uuid4())
+        body, headers = json_body({"code": code, "deviceDesc": description, "deviceID": device_id})
         try:
             resp = self.client.post(
                 f"{self.auth_host}/token/json/2/device/new",
-                json={"code": code, "deviceDesc": description, "deviceID": device_id},
-                headers={"Authorization": "Bearer"},
+                content=body,
+                headers={"Authorization": "Bearer", **headers},
             )
         except httpx.HTTPError as exc:
             raise ConnectionFailed(f"cannot reach the reMarkable cloud: {exc}") from exc
@@ -223,10 +234,12 @@ class CloudAuth:
             if not device:
                 raise AuthError(f"not registered with the reMarkable cloud; run `rmd cloud-login <code>` "
                                 f"with a code from {CONNECT_URL}")
+            body, headers = json_body(None)
             try:
                 resp = self.client.post(
                     f"{self.auth_host}/token/json/2/user/new",
-                    headers={"Authorization": f"Bearer {device}"},
+                    content=body,
+                    headers={"Authorization": f"Bearer {device}", **headers},
                 )
             except httpx.HTTPError as exc:
                 raise ConnectionFailed(f"cannot reach the reMarkable cloud: {exc}") from exc
@@ -329,11 +342,12 @@ class CloudStorage(DocumentStorage):
         )
 
     def put_root(self, root_hash: str, generation: int) -> int:
+        body, headers = json_body({"broadcast": self.notify, "hash": root_hash, "generation": generation})
         resp = self._request(
             "PUT",
             f"{self.sync_host}/sync/v3/root",
-            json={"broadcast": self.notify, "generation": generation, "hash": root_hash},
-            headers={"rm-filename": "roothash"},
+            content=body,
+            headers={"rm-filename": "roothash", **headers},
         ).json()
         if resp.get("hash") != root_hash:
             raise RemarkableError("cloud accepted a different root hash than the one sent")
