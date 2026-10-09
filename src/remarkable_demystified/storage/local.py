@@ -17,7 +17,7 @@ from .base import DocChange, DocumentRecord, DocumentStorage
 
 def _safe_join(root: Path, doc_id: str, name: str) -> Path:
     """Resolve ``name`` inside ``root`` and make sure it belongs to ``doc_id``."""
-    if xochitl.doc_id_of(name) != doc_id or ".." in Path(name).parts or name.startswith("/"):
+    if not xochitl.is_safe_file_name(doc_id, name) or ".." in Path(name).parts:
         raise InvalidRequest(f"{name!r} is not a file of document {doc_id!r}")
     return root / name
 
@@ -42,7 +42,7 @@ class LocalStorage(DocumentStorage):
         return records
 
     def list_files(self, doc_id: str) -> list[str]:
-        names = []
+        names: list[str] = []
         for path in self.root.glob(f"{doc_id}*"):
             if xochitl.doc_id_of(path.name) != doc_id:
                 continue

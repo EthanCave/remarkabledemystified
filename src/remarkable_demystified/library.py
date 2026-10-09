@@ -406,7 +406,7 @@ class Library:
         new_id = old_id if old_id not in self._records() and _looks_like_uuid(old_id) else xochitl.new_id()
         files: dict[str, bytes] = {}
         for n in names:
-            if xochitl.doc_id_of(n) != old_id or ".." in n.split("/") or n.startswith("/"):
+            if not xochitl.is_safe_file_name(old_id, n):
                 continue
             files[new_id + n[len(old_id):]] = zf.read(n)
         meta_name = xochitl.metadata_name(new_id)

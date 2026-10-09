@@ -8,8 +8,6 @@ version = "0.1.0"
 description = "Read, edit and manage the documents on a reMarkable tablet over SSH, USB or the reMarkable cloud, with a REST API and CLI."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [{ name = "Ethan Cave" }]
 dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
@@ -19,6 +17,7 @@ dependencies = [
     "rmscene>=0.7",
     "pypdf>=4.0",
     "pillow>=10.0",
+    "tomli>=2.0; python_version < \"3.11\"",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +32,7 @@ packages = ["src/remarkable_demystified"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+filterwarnings = ["ignore:Using .httpx. with .starlette.testclient. is deprecated:UserWarning"]
 
 [tool.ruff]
 line-length = 100

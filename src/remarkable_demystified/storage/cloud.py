@@ -185,7 +185,9 @@ class CloudAuth:
     def _save(self) -> None:
         self.token_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.token_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._tokens, indent=2))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # never world-readable
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(self._tokens, indent=2))
         os.chmod(tmp, 0o600)
         os.replace(tmp, self.token_file)
 
@@ -462,8 +464,8 @@ class CloudStorage(DocumentStorage):
                     for name in change.remove:
                         files.pop(name, None)
                     for name, data in change.write.items():
-                        if xochitl.doc_id_of(name) != change.doc_id:
-                            raise RemarkableError(f"{name} does not belong to {change.doc_id}")
+                        if not xochitl.is_safe_file_name(change.doc_id, name):
+                            raise RemarkableError(f"{name!r} is not a valid file of {change.doc_id}")
                         h = hashlib.sha256(data).hexdigest()
                         files[name] = IndexEntry(h, "0", name, 0, len(data))
                         if h not in uploaded:

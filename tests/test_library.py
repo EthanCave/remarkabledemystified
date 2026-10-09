@@ -262,3 +262,16 @@ def test_metadata_helpers_preserve_unknown_keys():
     m = {"visibleName": "a", "futureKey": {"x": 1}, "version": 3}
     out = xochitl.updated_metadata(m, visibleName="b")
     assert out["futureKey"] == {"x": 1} and out["version"] == 4 and m["visibleName"] == "a"
+
+
+@pytest.mark.parametrize("name", [
+    f"{PDF_ID}/../../etc/passwd",
+    f"{PDF_ID}.metadata\n/etc/passwd",
+    "/etc/passwd",
+    f"{NOTEBOOK_ID}.content",
+    f"{PDF_ID}/x\x00.rm",
+])
+def test_unsafe_file_names_rejected(library, name):
+    with pytest.raises(InvalidRequest):
+        library.read_file(PDF_ID, name)
+    assert not xochitl.is_safe_file_name(PDF_ID, name)

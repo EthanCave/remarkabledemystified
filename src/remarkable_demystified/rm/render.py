@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import io
+from typing import Any
 from xml.sax.saxutils import escape
 
 from PIL import Image, ImageDraw, ImageFont
@@ -128,11 +129,11 @@ def to_image(
         return (x - x0) * k, (y - y0) * k
 
     # Translucent marks first (highlights, highlighter, shader) so ink stays on top.
-    translucent = []
+    translucent: list[tuple[str, tuple[int, int, int], float, Any]] = []
     for hl in scene.highlights:
         for rect in hl.rects:
             translucent.append(("rect", hl.color[:3], 0.35, rect))
-    opaque = []
+    opaque: list[tuple[str, tuple[int, int, int], float, Any]] = []
     for stroke in scene.strokes:
         for seg in segments(stroke):
             (translucent if seg.opacity < 1 else opaque).append(("seg", seg.color, seg.opacity, seg))

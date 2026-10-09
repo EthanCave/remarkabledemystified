@@ -180,8 +180,8 @@ class SSHStorage(DocumentStorage):
                     ("\n".join(names) + "\n").encode(),
                 )
             for record in blob.split(RS)[1:]:
-                name, _, data = record.partition(US)
-                self._json_cache[name.decode(errors="replace")] = xochitl.loads(data)
+                raw_name, _, data = record.partition(US)
+                self._json_cache[raw_name.decode(errors="replace")] = xochitl.loads(data)
         self._stat_cache = current
 
         if current:
@@ -331,5 +331,5 @@ def _check_id(doc_id: str) -> None:
 
 def _check_name(doc_id: str, name: str) -> None:
     _check_id(doc_id)
-    if xochitl.doc_id_of(name) != doc_id or ".." in name.split("/") or name.startswith("/"):
+    if not xochitl.is_safe_file_name(doc_id, name):
         raise InvalidRequest(f"{name!r} is not a file of document {doc_id!r}")

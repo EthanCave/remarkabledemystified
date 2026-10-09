@@ -62,6 +62,21 @@ def doc_id_of(relative_path: str) -> str:
     return relative_path
 
 
+def is_safe_file_name(doc_id: str, name: str) -> bool:
+    """True if ``name`` is a plain relative path belonging to ``doc_id``.
+
+    Rejects ``..``, absolute paths and control characters (a newline would let a
+    name smuggle a second path into line-based remote commands).
+    """
+    return (
+        bool(doc_id)
+        and doc_id_of(name) == doc_id
+        and not name.startswith("/")
+        and ".." not in name.split("/")
+        and not any(ord(c) < 32 or c == "\x7f" for c in name)
+    )
+
+
 def metadata_name(doc_id: str) -> str:
     return f"{doc_id}.metadata"
 
