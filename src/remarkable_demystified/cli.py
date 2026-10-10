@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import __version__
-from .config import BACKENDS, connect, load_settings
+from .config import BACKENDS, connect, load_settings, read_config_file
 from .errors import InvalidRequest, NotFound, RemarkableError
 from .library import Library
 from .model import Item
@@ -244,6 +244,61 @@ def _common_options(default: object) -> argparse.ArgumentParser:
     return common
 
 
+def _mcp_client_config(args: argparse.Namespace, settings) -> dict[str, Any]:
+    """A ready-to-paste claude_desktop_config.json entry for this machine."""
+    import shutil
+
+    exe = shutil.which("rmd")
+    command, cli_args = (exe, ["mcp"]) if exe else (sys.executable, ["-m", "remarkable_demystified", "mcp"])
+    if args.allow_write:
+        cli_args.append("--allow-write")
+    env: dict[str, str] = {"RMD_BACKEND": settings.backend}
+    if settings.backend == "ssh":
+        if settings.ssh_host != "10.11.99.1":
+            env["RMD_SSH_HOST"] = settings.ssh_host
+        if settings.ssh_key:
+            env["RMD_SSH_KEY"] = settings.ssh_key
+        elif not (read_config_file(args.config).get("ssh") or {}).get("password"):
+            # Claude launches rmd with only this environment, so the password must come
+            # from here or the config file. Never print the real one.
+            env["RMD_SSH_PASSWORD"] = "<root password: Settings > Help > Copyrights and licenses>"
+    elif settings.backend == "local" and settings.local_dir:
+        env["RMD_LOCAL_DIR"] = str(Path(settings.local_dir).expanduser().resolve())
+    elif settings.backend == "usb" and settings.usb_url != "http://10.11.99.1":
+        env["RMD_USB_URL"] = settings.usb_url
+    if args.config:
+        env["RMD_CONFIG"] = str(Path(args.config).expanduser().resolve())
+    return {"mcpServers": {"remarkable": {"command": command, "args": cli_args, "env": env}}}
+
+
+def cmd_mcp(args: argparse.Namespace) -> None:
+    settings = load_settings(
+        args.config, backend=args.backend, ssh_host=args.host, ssh_password=args.password,
+        ssh_key=args.key, local_dir=args.local_dir,
+    )
+    if args.print_config:
+        _print_json(_mcp_client_config(args, settings))
+        return
+    try:
+        from .server.mcp_server import build_server
+    except ImportError as exc:
+        raise InvalidRequest(
+            f"the MCP server needs the optional extra: pip install 'remarkable-demystified[mcp]' ({exc})"
+        ) from exc
+    from .library import ALL_CAPABILITIES
+    from .storage.usbweb import UsbWebLibrary
+
+    caps = UsbWebLibrary.capabilities if settings.backend == "usb" else ALL_CAPABILITIES
+    server = build_server(
+        lambda: connect(settings),
+        allow_write=args.allow_write,
+        capabilities=caps,
+        max_upload_mb=settings.max_upload_mb,
+    )
+    # stdio transport: stdout belongs to the protocol, so nothing else may print to it.
+    server.run()
+
+
 def build_parser() -> argparse.ArgumentParser:
     # Options work before or after the subcommand; SUPPRESS keeps the subcommand's
     # copy from overwriting a value given before it.
@@ -332,6 +387,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("cloud-login", help="connect to your reMarkable cloud account", parents=[common])
     p.add_argument("code", nargs="?", help="8-letter code from my.remarkable.com/device/browser/connect")
     p.set_defaults(func=None, standalone=cmd_cloud_login)
+
+    p = sub.add_parser("mcp", help="run the MCP server for Claude Desktop / Claude Code (stdio)", parents=[common])
+    p.add_argument("--allow-write", action="store_true",
+                   help="also offer tools that create, rename, move, upload and trash (never permanent delete)")
+    p.add_argument("--print-config", action="store_true",
+                   help="print a claude_desktop_config.json entry for this machine and exit")
+    p.set_defaults(func=None, standalone=cmd_mcp)
 
     p = sub.add_parser("serve", help="run the REST API", parents=[common])
     p.add_argument("--bind", default="127.0.0.1", help="interface to listen on (default 127.0.0.1)")

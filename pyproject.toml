@@ -21,7 +21,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.5", "mypy>=1.10"]
+# MCP server for Claude Desktop / Claude Code (`rmd mcp`); pypdfium2 lets page images show the PDF underneath
+mcp = ["mcp>=2.2,<3", "pypdfium2>=4"]
+# draw the PDF page behind PNG/SVG page renders
+render = ["pypdfium2>=4"]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.5", "mypy>=1.10", "mcp>=2.2,<3", "pypdfium2>=4"]
 
 [project.scripts]
 rmd = "remarkable_demystified.cli:main"

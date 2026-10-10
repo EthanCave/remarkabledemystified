@@ -184,18 +184,37 @@ class PageScene:
     def is_empty(self) -> bool:
         return not (self.strokes or self.highlights or (self.text and self.text.paragraphs))
 
-    def bounds(self) -> tuple[float, float, float, float]:
-        """``(x0, y0, x1, y1)`` covering the page and everything drawn on it."""
-        x0, y0, x1, y1 = 0.0, 0.0, float(self.width), float(self.height)
+    def ink_bounds(self) -> tuple[float, float, float, float] | None:
+        """``(x0, y0, x1, y1)`` of pen strokes and typed text; ``None`` if there are none.
+
+        PDF text highlights (``GlyphRange``) are left out on purpose: their
+        rectangles do not seem to share the stroke coordinate frame (the real
+        samples place them partly off the page), so they must not resize pages.
+        """
+        xs: list[float] = []
+        ys: list[float] = []
         for s in self.strokes:
             for p in s.points:
                 half = p.width / 2
-                x0, x1 = min(x0, p.x - half), max(x1, p.x + half)
-                y0, y1 = min(y0, p.y - half), max(y1, p.y + half)
+                xs += (p.x - half, p.x + half)
+                ys += (p.y - half, p.y + half)
         if self.text:
             for para in self.text.paragraphs:
-                y1 = max(y1, para.y + line_height(para.style) * max(1, len(para.lines)))
-        return x0, y0, x1, y1
+                if para.text.strip():
+                    xs += (self.text.x, self.text.x + self.text.width)
+                    # para.y is the first baseline; leave room for ascenders
+                    ys += (para.y - line_height(para.style), para.y + line_height(para.style) * len(para.lines))
+        if not xs:
+            return None
+        return min(xs), min(ys), max(xs), max(ys)
+
+    def bounds(self) -> tuple[float, float, float, float]:
+        """``(x0, y0, x1, y1)`` covering the page and everything drawn on it."""
+        x0, y0, x1, y1 = 0.0, 0.0, float(self.width), float(self.height)
+        ink = self.ink_bounds()
+        if ink is None:
+            return x0, y0, x1, y1
+        return min(x0, ink[0]), min(y0, ink[1]), max(x1, ink[2]), max(y1, ink[3])
 
 
 # ---------------------------------------------------------------------------

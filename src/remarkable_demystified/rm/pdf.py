@@ -15,6 +15,7 @@ page is anchored to the top-left corner.
 from __future__ import annotations
 
 import io
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -33,6 +34,8 @@ from .scene import PageScene
 from .style import segments
 
 PX_TO_PT = 72.0 / xochitl.RM2_DPI
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -66,9 +69,16 @@ def pdf_page_transform(box: RectangleObject, scene: PageScene) -> Transform:
     return Transform(1.0 / k, dx, bottom + h)
 
 
-def _escape_pdf_text(s: str) -> str:
-    s = s.encode("cp1252", errors="replace").decode("cp1252")
-    return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+#: Characters our text layout uses that the standard PDF fonts (WinAnsi) cannot show.
+_WINANSI_SUBSTITUTES = {"\u2610": "[ ]", "\u2611": "[x]", "\u25e6": "-"}
+
+
+def _pdf_string(s: str) -> bytes:
+    """``s`` as the bytes of a PDF literal string in WinAnsiEncoding (cp1252), escaped."""
+    for char, substitute in _WINANSI_SUBSTITUTES.items():
+        s = s.replace(char, substitute)
+    raw = s.encode("cp1252", errors="replace")
+    return raw.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
 
 
 def content_stream(scene: PageScene, t: Transform) -> tuple[bytes, dict[str, float], bool]:
@@ -76,7 +86,7 @@ def content_stream(scene: PageScene, t: Transform) -> tuple[bytes, dict[str, flo
 
     Returns ``(operators, {gs_name: alpha}, uses_font)``.
     """
-    ops: list[str] = ["q", "1 j"]
+    ops: list[str | bytes] = ["q", "1 j"]
     alphas: dict[str, float] = {}
 
     def gs(alpha: float) -> str:
@@ -114,11 +124,13 @@ def content_stream(scene: PageScene, t: Transform) -> tuple[bytes, dict[str, flo
             px, py = t(x, y)
             font = "RMfB" if weight == "bold" else "RMf"
             ops.append(
-                f"BT /{font} {size * t.scale:.2f} Tf 0 g {px:.2f} {py:.2f} Td "
-                f"({_escape_pdf_text(line)}) Tj ET"
+                f"BT /{font} {size * t.scale:.2f} Tf 0 g {px:.2f} {py:.2f} Td (".encode()
+                + _pdf_string(line)
+                + b") Tj ET"
             )
     ops.append("Q")
-    return "\n".join(ops).encode("latin-1"), alphas, uses_font
+    data = b"\n".join(op if isinstance(op, bytes) else op.encode("ascii") for op in ops)
+    return data, alphas, uses_font
 
 
 def _overlay_page(writer: PdfWriter, scene: PageScene, t: Transform, box: RectangleObject) -> PageObject:
@@ -152,6 +164,42 @@ def _overlay_page(writer: PdfWriter, scene: PageScene, t: Transform, box: Rectan
     return page
 
 
+def _grown_box(box: RectangleObject, scene: PageScene, t: Transform) -> RectangleObject:
+    """``box`` enlarged to hold any ink written past the edge of the page.
+
+    The tablet lets you write beyond a PDF page's border (or scroll a page
+    down). Exporting into the original box would cut those strokes off.
+    """
+    ink = scene.ink_bounds()
+    left, bottom, right, top = float(box.left), float(box.bottom), float(box.right), float(box.top)
+    if ink is None:
+        return RectangleObject([left, bottom, right, top])
+    ax, ay = t(ink[0], ink[1])  # top-left of the ink, in PDF space (y up)
+    bx, by = t(ink[2], ink[3])  # bottom-right
+    return RectangleObject([
+        min(left, ax, bx), min(bottom, ay, by), max(right, ax, bx), max(top, ay, by),
+    ])
+
+
+def _union(a: RectangleObject, b: RectangleObject) -> RectangleObject:
+    return RectangleObject([
+        min(float(a.left), float(b.left)), min(float(a.bottom), float(b.bottom)),
+        max(float(a.right), float(b.right)), max(float(a.top), float(b.top)),
+    ])
+
+
+def _draw(writer: PdfWriter, page: PageObject, scene: PageScene, t: Transform) -> None:
+    """Merge ``scene`` onto ``page``, growing the page if ink spills over its edges."""
+    box = _grown_box(page.cropbox, scene, t)
+    if box != page.cropbox:
+        page.mediabox = _union(page.mediabox, box)
+        page.cropbox = box
+        for name in ("/TrimBox", "/BleedBox", "/ArtBox"):  # stale boxes would re-crop in some viewers
+            if name in page:
+                del page[name]
+    page.merge_page(_overlay_page(writer, scene, t, box))
+
+
 def annotate_pdf(
     source: bytes,
     pages: Sequence[tuple[int | None, PageScene | None]],
@@ -162,7 +210,8 @@ def annotate_pdf(
 
     ``pages`` lists the document's pages in tablet order as
     ``(source_page_index or None, scene or None)``. Pages inserted on the
-    tablet (``None`` source index) become blank pages.
+    tablet (``None`` source index) become blank pages. Pages grow to fit ink
+    written past their edges.
     """
     reader = PdfReader(io.BytesIO(source))
     writer = PdfWriter()
@@ -170,35 +219,30 @@ def annotate_pdf(
         if src_index is not None and 0 <= src_index < len(reader.pages):
             writer.add_page(reader.pages[src_index])
             page = writer.pages[-1]
-            box = page.cropbox
             if scene is not None and not scene.is_empty:
-                page.merge_page(_overlay_page(writer, scene, pdf_page_transform(box, scene), box))
+                _draw(writer, page, scene, pdf_page_transform(page.cropbox, scene))
         else:
             w, h = blank_size or (xochitl.RM2_WIDTH * PX_TO_PT, xochitl.RM2_HEIGHT * PX_TO_PT)
             page = writer.add_blank_page(width=w, height=h)
             if scene is not None and not scene.is_empty:
-                box = page.mediabox
                 k = min(scene.width / w, scene.height / h)
-                t = Transform(1 / k, 0.0, h)
-                page.merge_page(_overlay_page(writer, scene, t, box))
+                _draw(writer, page, scene, Transform(1 / k, 0.0, h))
     out = io.BytesIO()
     writer.write(out)
     return out.getvalue()
 
 
 def notebook_pdf(scenes: Sequence[PageScene | None], *, grow: bool = True) -> bytes:
-    """One PDF page per notebook page; pages grow downwards to fit long scrolls."""
+    """One PDF page per notebook page; pages grow to fit ink past any edge (long scrolls)."""
     writer = PdfWriter()
     for scene in scenes:
         if scene is None:
             writer.add_blank_page(width=xochitl.RM2_WIDTH * PX_TO_PT, height=xochitl.RM2_HEIGHT * PX_TO_PT)
             continue
-        x0, y0, x1, y1 = scene.bounds() if grow else (0, 0, scene.width, scene.height)
-        y0 = min(0.0, y0)
-        height_px = y1 - y0
-        w, h = scene.width * PX_TO_PT, height_px * PX_TO_PT
+        x0, y0, x1, y1 = scene.bounds() if grow else (0.0, 0.0, float(scene.width), float(scene.height))
+        w, h = (x1 - x0) * PX_TO_PT, (y1 - y0) * PX_TO_PT
         page = writer.add_blank_page(width=w, height=h)
-        t = Transform(PX_TO_PT, 0.0, (height_px + y0) * PX_TO_PT)
+        t = Transform(PX_TO_PT, -x0 * PX_TO_PT, h + y0 * PX_TO_PT)
         if not scene.is_empty:
             page.merge_page(_overlay_page(writer, scene, t, page.mediabox))
     out = io.BytesIO()
@@ -215,6 +259,23 @@ def single_page(pdf: bytes, index: int) -> bytes:
     return out.getvalue()
 
 
+def page_texts(pdf: bytes, indices: Sequence[int]) -> dict[int, str]:
+    """Extracted text layer of the given (0-based) PDF pages; pages without text are left out."""
+    reader = PdfReader(io.BytesIO(pdf))
+    out = {}
+    for i in indices:
+        if not 0 <= i < len(reader.pages):
+            continue
+        try:
+            text = reader.pages[i].extract_text() or ""
+        except Exception as exc:  # noqa: BLE001 - malformed pages must not sink the request
+            log.warning("could not extract text from PDF page %d: %s", i, exc)
+            continue
+        if text.strip():
+            out[i] = text
+    return out
+
+
 def page_count(pdf: bytes) -> int:
     return len(PdfReader(io.BytesIO(pdf)).pages)
 
@@ -224,10 +285,24 @@ def page_sizes(pdf: bytes) -> list[tuple[float, float]]:
 
 
 def rasterize_page(pdf: bytes, index: int, width_px: int):
-    """Render one PDF page to a Pillow image, if PyMuPDF or poppler is available.
+    """Render one PDF page to a Pillow image with pypdfium2, PyMuPDF or poppler.
 
-    Returns ``None`` when no rasterizer is installed (pages then render on white).
+    Returns ``None`` when none of them is installed (pages then render on white).
     """
+    try:
+        import pypdfium2  # optional: pip install 'remarkable-demystified[render]'
+    except ImportError:
+        pypdfium2 = None
+    if pypdfium2 is not None:
+        doc = pypdfium2.PdfDocument(pdf)
+        try:
+            page = doc[index]
+            image = page.render(scale=width_px / page.get_width()).to_pil().convert("RGB")
+            page.close()
+            return image
+        finally:
+            doc.close()
+
     try:
         import fitz  # PyMuPDF (optional)
     except ImportError:
@@ -235,10 +310,10 @@ def rasterize_page(pdf: bytes, index: int, width_px: int):
     if fitz is not None:
         from PIL import Image
 
-        doc = fitz.open(stream=pdf, filetype="pdf")
-        page = doc[index]
-        zoom = width_px / page.rect.width
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        fdoc = fitz.open(stream=pdf, filetype="pdf")
+        fpage = fdoc[index]
+        zoom = width_px / fpage.rect.width
+        pix = fpage.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
     import shutil

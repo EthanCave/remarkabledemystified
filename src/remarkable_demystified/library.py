@@ -590,6 +590,25 @@ class Library:
             scenes = [None]
         return rmpdf.notebook_pdf(scenes)
 
+    def pdf_text(self, item_id: str, pages: Iterable[int] | None = None) -> dict[int, str]:
+        """Printed text of the PDF page behind each tablet page: ``{tablet page index: text}``.
+
+        Uses the PDF's own text layer (scanned PDFs have none). EPUBs work once the
+        tablet has converted them to PDF. Inserted pages and notebooks have no entry.
+        """
+        item = self._document(item_id)
+        files = set(self.storage.list_files(item_id))
+        source_pdf = self._render_pdf_source(item, sorted(files))
+        if source_pdf is None:
+            return {}
+        wanted = set(pages) if pages is not None else None
+        refs = [
+            r for r in self._page_refs(item, files)
+            if r.source_page is not None and (wanted is None or r.index in wanted)
+        ]
+        texts = rmpdf.page_texts(source_pdf, sorted({r.source_page for r in refs if r.source_page is not None}))
+        return {r.index: texts[r.source_page] for r in refs if r.source_page in texts}
+
     def text(self, item_id: str) -> DocumentText:
         """Typed text and highlighted passages, page by page."""
         item = self._document(item_id)
@@ -606,14 +625,15 @@ class Library:
                     text = sc.text.to_markdown()
                 for hl in sc.highlights:
                     if hl.text.strip():
-                        highlights.append(Highlight(hl.text, ref.index, "#{:02x}{:02x}{:02x}".format(*hl.color[:3])))
+                        color = "#{:02x}{:02x}{:02x}".format(*hl.color[:3])
+                        highlights.append(Highlight(hl.text, ref.index, color, ref.source_page))
             if text or highlights:
-                pages.append(PageText(ref.index, text, highlights))
-        return DocumentText(item.id, item.name, pages)
+                pages.append(PageText(ref.index, text, highlights, ref.source_page))
+        return DocumentText(item.id, item.name, pages, item.file_type)
 
     def _legacy_highlights(self, doc_id: str, refs: list[xochitl.PageRef], files: set[str]) -> dict[int, list[Highlight]]:
         """Highlights stored by firmware 2.x in ``<id>.highlights/<page>.json``."""
-        wanted = {f"{doc_id}.highlights/{r.id}.json": r.index for r in refs}
+        wanted = {f"{doc_id}.highlights/{r.id}.json": r for r in refs}
         present = [n for n in wanted if n in files]
         if not present:
             return {}
@@ -623,10 +643,13 @@ class Library:
                 groups = json.loads(data).get("highlights", [])
             except (ValueError, AttributeError):
                 continue
+            ref = wanted[name]
             for group in groups:
                 for hl in group if isinstance(group, list) else [group]:
                     if isinstance(hl, dict) and hl.get("text"):
-                        out.setdefault(wanted[name], []).append(Highlight(hl["text"], wanted[name]))
+                        out.setdefault(ref.index, []).append(
+                            Highlight(hl["text"], ref.index, source_page=ref.source_page)
+                        )
         return out
 
     # ------------------------------------------------------------------

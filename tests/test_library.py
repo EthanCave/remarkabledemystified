@@ -275,3 +275,63 @@ def test_unsafe_file_names_rejected(library, name):
     with pytest.raises(InvalidRequest):
         library.read_file(PDF_ID, name)
     assert not xochitl.is_safe_file_name(PDF_ID, name)
+
+
+def test_highlights_cite_the_pdf_page_not_the_tablet_position(library, xochitl_dir):
+    # Tablet page 4 (index 3) shows PDF page 3 (index 2) because a blank page was inserted.
+    (xochitl_dir / PDF_ID / "p-d.rm").write_bytes((xochitl_dir / PDF_ID / "p-a.rm").read_bytes())
+    doc = library.text(PDF_ID)
+    last = doc.pages[-1]
+    assert (last.index, last.source_page) == (3, 2)
+    assert {(h.page_index, h.source_page) for h in last.highlights} == {(3, 2)}
+    md = doc.to_markdown()
+    assert "## Page 1\n" in md  # PDF page 1 is tablet page 1: no need to say both
+    assert "## PDF page 3 (tablet page 4)\n" in md
+    assert doc.to_dict()["pages"][-1]["source_page"] == 2
+    assert doc.to_dict()["file_type"] == "pdf"
+    notes = library.text(NOTEBOOK_ID).to_markdown()
+    assert "## Page 1\n" in notes and "PDF page" not in notes
+
+
+def test_pdf_export_grows_pages_for_ink_past_the_edge(library, xochitl_dir):
+    from conftest import make_v5_lines
+
+    def page_boxes():
+        reader = PdfReader(io.BytesIO(library.export_pdf(PDF_ID)))
+        return [(float(p.mediabox.left), float(p.mediabox.bottom), float(p.mediabox.right),
+                 float(p.mediabox.top)) for p in reader.pages], reader
+
+    boxes, _ = page_boxes()
+    assert boxes[2] == (0, 0, 612, 792)  # ink fully inside: page untouched
+
+    # v5 page anchored top-left; letter page is 612pt = 1404px wide at k=2.294 px/pt.
+    # A stroke from x=1300 to x=1700px (past the right edge) and y=2000px (past the bottom).
+    (xochitl_dir / PDF_ID / "p-c.rm").write_bytes(make_v5_lines([(4, 0, [(1300, 100), (1700, 2000)])]))
+    boxes, reader = page_boxes()
+    left, bottom, right, top = boxes[2]
+    k = 1404 / 612
+    assert right == pytest.approx((1700 + 1.25) / k, abs=0.5)  # half the 2.5px stroke width
+    assert bottom == pytest.approx(792 - (2000 + 1.25) / k, abs=0.5)
+    assert (left, top) == (0, 792)
+    page = reader.pages[2]
+    assert [float(v) for v in page.cropbox] == [left, bottom, right, top]
+    # the overlay is no longer clipped to the original 612x792 box
+    assert b"0.0 0.0 612 792 re" not in page.get_contents().get_data()
+
+
+def test_notebook_export_grows_left_and_down(library, xochitl_dir):
+    from conftest import make_v5_lines
+
+    (xochitl_dir / LEGACY_ID / "l-1.rm").write_bytes(make_v5_lines([(4, 0, [(-200, 100), (500, 3000)])]))
+    page = PdfReader(io.BytesIO(library.export_pdf(LEGACY_ID))).pages[0]
+    px = 72 / 226
+    assert float(page.mediabox.width) == pytest.approx((1404 + 201.25) * px, abs=0.5)
+    assert float(page.mediabox.height) == pytest.approx((3000 + 1.25) * px, abs=0.5)
+
+
+def test_pdf_export_of_bullets_and_checkboxes(library):
+    # Regression: "•", "☐" and "☑" are not Latin-1 and used to crash the PDF export.
+    nb = library.create_notebook("Todo", text="# Plan\n- eggs\n  - free range\n- [ ] milk\n- [x] bread\nnaïve café (x)")
+    text = PdfReader(io.BytesIO(library.export_pdf(nb.id))).pages[0].extract_text()
+    for line in ("Plan", "• eggs", "- free range", "[ ] milk", "[x] bread", "naïve café (x)"):
+        assert line in text

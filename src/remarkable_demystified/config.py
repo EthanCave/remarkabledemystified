@@ -111,14 +111,26 @@ def _coerce(name: str, value: Any) -> Any:
     return None if value == "" else str(value)
 
 
+def config_file_path(config_file: str | os.PathLike[str] | None = None) -> Path:
+    return Path(config_file or os.environ.get("RMD_CONFIG") or config_dir() / "config.toml").expanduser()
+
+
+def read_config_file(config_file: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+    """The raw TOML of the config file, or ``{}`` if there is none."""
+    path = config_file_path(config_file)
+    if not path.exists():
+        return {}
+    try:
+        return tomllib.loads(path.read_text())
+    except tomllib.TOMLDecodeError as exc:
+        raise InvalidRequest(f"{path} is not valid TOML: {exc}") from exc
+
+
 def load_settings(config_file: str | os.PathLike[str] | None = None, **overrides: Any) -> Settings:
     settings = Settings()
-    path = Path(config_file or os.environ.get("RMD_CONFIG") or config_dir() / "config.toml").expanduser()
+    path = config_file_path(config_file)
     if path.exists():
-        try:
-            data = tomllib.loads(path.read_text())
-        except tomllib.TOMLDecodeError as exc:
-            raise InvalidRequest(f"{path} is not valid TOML: {exc}") from exc
+        data = read_config_file(config_file)
         for (section, key), name in _FILE_KEYS.items():
             scope = data if not section else data.get(section, {})
             if isinstance(scope, dict) and key in scope:

@@ -77,12 +77,16 @@ class PageOut(BaseModel):
 
 class HighlightOut(BaseModel):
     text: str
-    page_index: int
+    page_index: int = Field(description="0-based position of the page on the tablet")
     color: str | None = None
+    source_page: int | None = Field(
+        None, description="0-based page of the original PDF/EPUB (cite this; differs once pages are inserted)"
+    )
 
 
 class PageTextOut(BaseModel):
     index: int
+    source_page: int | None = None
     text: str
     highlights: list[HighlightOut]
 
@@ -90,6 +94,7 @@ class PageTextOut(BaseModel):
 class TextOut(BaseModel):
     id: str
     name: str
+    file_type: str | None = None
     pages: list[PageTextOut]
 
 
