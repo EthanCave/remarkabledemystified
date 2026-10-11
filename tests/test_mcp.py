@@ -19,7 +19,10 @@ pytest.importorskip("mcp")
 from mcp import Client  # noqa: E402
 from mcp.client.stdio import StdioServerParameters  # noqa: E402
 
-from remarkable_demystified.server.mcp_server import build_server, parse_page_selection  # noqa: E402
+from remarkable_demystified.server.mcp_server import (  # noqa: E402
+    build_server,
+    parse_page_selection,
+)
 from remarkable_demystified.storage.usbweb import UsbWebLibrary, UsbWebStorage  # noqa: E402
 
 READ_TOOLS = {"browse", "find", "recent", "current", "list_pages", "read_document", "view_pages", "device_info"}
