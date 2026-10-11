@@ -216,13 +216,25 @@ class PageScene:
             return None
         return min(xs), min(ys), max(xs), max(ys)
 
-    def bounds(self) -> tuple[float, float, float, float]:
-        """``(x0, y0, x1, y1)`` covering the page and everything drawn on it."""
+    def bounds(self, tolerance: float = 0.0) -> tuple[float, float, float, float]:
+        """``(x0, y0, x1, y1)`` covering the page and everything drawn on it.
+
+        A side only grows when ink passes it by more than ``tolerance`` pixels, so a
+        stroke drawn up to the screen edge does not change the page size.
+        """
         x0, y0, x1, y1 = 0.0, 0.0, float(self.width), float(self.height)
         ink = self.ink_bounds()
         if ink is None:
             return x0, y0, x1, y1
-        return min(x0, ink[0]), min(y0, ink[1]), max(x1, ink[2]), max(y1, ink[3])
+        if x0 - ink[0] > tolerance:
+            x0 = ink[0]
+        if y0 - ink[1] > tolerance:
+            y0 = ink[1]
+        if ink[2] - x1 > tolerance:
+            x1 = ink[2]
+        if ink[3] - y1 > tolerance:
+            y1 = ink[3]
+        return x0, y0, x1, y1
 
 
 # ---------------------------------------------------------------------------

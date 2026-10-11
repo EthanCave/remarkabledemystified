@@ -43,8 +43,9 @@ MAX_IMAGES_PER_CALL = 8
 TILE_OVERLAP = 64
 #: Render scale for page images: the tablet's 1872px page height comes out at ~1568px.
 VIEW_SCALE = 0.85
-#: Never render more than this many pixels of a scrolled page (in tablet pixels).
-MAX_VIEW_HEIGHT = MAX_IMAGES_PER_CALL * 2160
+#: How far a page may extend before view_pages stops, in page heights (down) and page
+#: widths (sideways). Seven screens tile into at most MAX_IMAGES_PER_CALL images.
+MAX_VIEW_SCREENS = 7
 MAX_BROWSE_ENTRIES = 200
 MAX_LIST_PAGES = 500
 UPLOAD_EXTENSIONS = (".pdf", ".epub", ".rmdoc", ".zip")
@@ -250,28 +251,49 @@ def build_server(
         with session() as lib:
             root = folder(lib, path)
             budget = [MAX_BROWSE_ENTRIES]
+            cut_short: list[str] = []
 
-            def expand(folder_id: str, level: int, skip: int) -> list[dict[str, Any]]:
+            def expand(folder_id: str, level: int) -> list[dict[str, Any]]:
                 out = []
-                for child in lib.children(folder_id)[skip:]:
+                children = lib.children(folder_id)
+                for child in children:
                     if budget[0] <= 0:
                         break
                     budget[0] -= 1
                     entry = _brief(lib, child)
                     if child.is_folder and level < depth:
-                        entry["items"] = expand(child.id, level + 1, 0)
+                        entry["items"] = expand(child.id, level + 1)
                     out.append(entry)
+                if len(out) < len(children):
+                    cut_short.append(lib.path(folder_id))
                 return out
 
-            total = len(lib.children(root.id))
-            result: dict[str, Any] = {"folder": lib.path(root.id), "total": total, "items": expand(root.id, 1, offset)}
-            if budget[0] <= 0:
-                shown = len(result["items"])
-                result["note"] = (
-                    f"Output capped at {MAX_BROWSE_ENTRIES} entries. "
-                    + (f"Call again with offset={offset + shown} for more of this folder."
-                       if offset + shown < total else "Use depth=1 or browse subfolders one at a time.")
-                )
+            top = lib.children(root.id)[offset:]
+            items: list[dict[str, Any]] = []
+            complete = 0  # top-level entries listed in full (with all their contents)
+            for child in top:
+                if budget[0] <= 0:
+                    break
+                budget[0] -= 1
+                entry = _brief(lib, child)
+                before = len(cut_short)
+                if child.is_folder and depth > 1:
+                    entry["items"] = expand(child.id, 2)
+                if len(cut_short) > before:
+                    entry["items_truncated"] = True
+                items.append(entry)
+                if len(cut_short) == before:
+                    complete += 1
+            total = offset + len(top)
+            result: dict[str, Any] = {"folder": lib.path(root.id), "total": total, "items": items}
+            notes = []
+            if offset + complete < total:
+                notes.append(f"Output capped at {MAX_BROWSE_ENTRIES} entries; call again with offset={offset + complete} "
+                             "for the rest of this folder.")
+            if cut_short:
+                notes.append("Cut short (browse each directly for the rest): " + ", ".join(dict.fromkeys(cut_short)))
+            if notes:
+                result["note"] = " ".join(notes)
             return result
 
     def find(
@@ -391,7 +413,7 @@ def build_server(
             infos = pages[first_page - 1 : first_page - 1 + count]
             rendered = lib.render_pages(
                 item.id, [p.index for p in infos], "png",
-                scale=VIEW_SCALE, background=True, crop="content", max_height=MAX_VIEW_HEIGHT,
+                scale=VIEW_SCALE, background=True, crop="content", max_screens=MAX_VIEW_SCREENS,
             )
             out: list[Any] = []
             images = 0
@@ -418,7 +440,8 @@ def build_server(
                     out.append(f"[Page {info.index + 1}: only {len(tiles)} of {total_tiles} parts fit in this "
                                "call; view this page on its own to see the rest.]")
                 if page.truncated:
-                    out.append(f"[Page {info.index + 1} continues further down than can be shown.]")
+                    out.append(f"[Page {info.index + 1} has ink further out than can be shown "
+                               f"(more than {MAX_VIEW_SCREENS} screens away).]")
                 shown_last = info.index + 1
             if shown_last < total:
                 note = f"[Showed pages {first_page}-{shown_last} of {total}."
@@ -454,6 +477,7 @@ def build_server(
     ) -> dict[str, Any]:
         """Create a notebook on the tablet with typed text on its first page."""
         with session() as lib:
+            Library._check_name(name)  # before creating any folder
             parent = lib.ensure_folder(folder_path)
             return _brief(lib, lib.create_notebook(name, parent.id, text=markdown or None))
 
@@ -516,7 +540,9 @@ def build_server(
         except OSError:
             raise ToolError(f"cannot read {path.name!r}") from None
         with session() as lib:
-            validate_upload(data, path.name)  # before creating any folder
+            # every check the upload can fail on runs before any folder is created
+            validate_upload(data, path.name, max_unpacked=max_upload)
+            Library._check_name(name or path.stem)
             parent = lib.ensure_folder(folder_path)
             return _brief(lib, lib.upload(data, path.name, parent=parent.id, name=name, max_unpacked=max_upload))
 

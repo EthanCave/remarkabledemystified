@@ -111,7 +111,8 @@ class SSHStorage(DocumentStorage):
                 if self.strict_host_key and "not found in known_hosts" in str(exc):
                     raise ConnectionFailed(
                         f"{self.host} is not in {self.known_hosts} and strict host key checking is on. "
-                        "Connect once with it off (over USB) or add the key with ssh-keyscan."
+                        "Keys are remembered per address: connect once to this same address with strict "
+                        f"mode off, or add it with: ssh-keyscan -p {self.port} {self.host} >> {self.known_hosts}"
                     ) from exc
                 raise ConnectionFailed(f"Cannot reach the tablet at {self.host}:{self.port}: {exc}") from exc
             except (TimeoutError, OSError) as exc:

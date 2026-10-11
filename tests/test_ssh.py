@@ -178,7 +178,7 @@ def test_host_key_trust(sshd, tmp_path, caplog):
 
     strict = SSHStorage("127.0.0.1", port=sshd["port"], username=getpass.getuser(), key_filename=sshd["key"],
                         xochitl_dir=str(tmp_path), known_hosts=tmp_path / "kh", strict_host_key=True)
-    with pytest.raises(ConnectionFailed, match="strict host key checking"):
+    with pytest.raises(ConnectionFailed, match="ssh-keyscan -p"):
         strict.run("true")
     tofu = SSHStorage("127.0.0.1", port=sshd["port"], username=getpass.getuser(), key_filename=sshd["key"],
                       xochitl_dir=str(tmp_path), known_hosts=tmp_path / "kh")

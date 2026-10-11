@@ -9,6 +9,7 @@ builds every higher-level operation (rename, upload, render, ...) on top of it.
 
 from __future__ import annotations
 
+import json
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
@@ -16,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .. import xochitl
+from ..errors import NotFound, RemarkableError
 
 
 @dataclass
@@ -52,10 +54,27 @@ class DocChange:
 
 
 def resolved_writes(change: DocChange, read_current: Callable[[str], bytes | None]) -> dict[str, bytes]:
-    """``change.write`` plus the result of each patch applied to the file as it is now."""
+    """``change.write`` plus the result of each patch applied to the file as it is now.
+
+    A patch never invents a document: a missing ``.metadata`` means the document
+    was deleted meanwhile (:class:`NotFound`). A file that is not valid JSON is left
+    alone rather than replaced by a near-empty one.
+    """
     writes = dict(change.write)
     for name, fn in change.patch.items():
-        writes[name] = xochitl.dumps(fn(xochitl.loads(read_current(name))))
+        raw = read_current(name)
+        if raw is None or not raw.strip():
+            if name.endswith(".metadata"):
+                raise NotFound(f"document {change.doc_id} no longer exists")
+            current: dict[str, Any] = {}
+        else:
+            try:
+                current = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                current = None  # type: ignore[assignment]
+            if not isinstance(current, dict):
+                raise RemarkableError(f"{name} is not valid JSON; not changing it")
+        writes[name] = xochitl.dumps(fn(current))
     return writes
 
 

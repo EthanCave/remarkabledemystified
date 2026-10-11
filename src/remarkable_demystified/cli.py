@@ -266,15 +266,17 @@ def _mcp_client_config(args: argparse.Namespace, settings) -> dict[str, Any]:
     defaults = Settings()
     env: dict[str, str] = {"RMD_BACKEND": settings.backend}
     config_file = config_file_path(args.config)
-    if config_file.exists():
+    has_config = config_file.exists()
+    if has_config:
         env["RMD_CONFIG"] = absolute(str(config_file))
     if settings.backend == "ssh":
         for name in ("ssh_host", "ssh_port", "ssh_user", "ssh_restart", "xochitl_dir"):
-            if getattr(settings, name) != getattr(defaults, name):
+            # With a config file, spell values out: a flag may override the file with a default.
+            if has_config or getattr(settings, name) != getattr(defaults, name):
                 env[f"RMD_{name.upper()}"] = str(getattr(settings, name))
         if settings.ssh_strict_host_key:
             env["RMD_SSH_STRICT_HOST_KEY"] = "true"
-        env["RMD_KNOWN_HOSTS"] = absolute(settings.known_hosts)
+        env["RMD_KNOWN_HOSTS"] = absolute(settings.known_hosts) if settings.known_hosts else ""
         if settings.ssh_key:
             env["RMD_SSH_KEY"] = absolute(settings.ssh_key)
         elif not (read_config_file(args.config).get("ssh") or {}).get("password"):
@@ -284,8 +286,10 @@ def _mcp_client_config(args: argparse.Namespace, settings) -> dict[str, Any]:
     elif settings.backend == "usb" and settings.usb_url != defaults.usb_url:
         env["RMD_USB_URL"] = settings.usb_url
     elif settings.backend == "cloud":
-        env["RMD_CLOUD_TOKEN_FILE"] = absolute(settings.cloud_token_file)
-        env["RMD_CACHE_DIR"] = absolute(settings.cache_dir)
+        if settings.cloud_token_file:
+            env["RMD_CLOUD_TOKEN_FILE"] = absolute(settings.cloud_token_file)
+        if settings.cache_dir:
+            env["RMD_CACHE_DIR"] = absolute(settings.cache_dir)
     return {"mcpServers": {"remarkable": {"command": command, "args": cli_args, "env": env}}}
 
 

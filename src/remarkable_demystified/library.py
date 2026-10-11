@@ -177,7 +177,7 @@ class Library:
             return self.get(ref)
         if ref.lower() in ("trash", "/trash"):
             return TRASH_ITEM
-        parts = [p for p in ref.split("/") if p]
+        parts = [p for p in ref.split("/") if p and p != "."]
         items = self.items(include_trash=True)
         children: dict[str, list[Item]] = {}
         for item in items:
@@ -220,11 +220,25 @@ class Library:
                     continue
                 if k == len(rest):
                     return pick(parent, name, found)
-                for folder in newest_first([i for i in found if i.is_folder]):
+                folders = [i for i in found if i.is_folder]
+                if not folders:
+                    deepest = deepest or NotFound(f"{self.path(found[0].id)} is a document, not a folder")
+                    continue
+                results: dict[str, Item] = {}
+                for folder in newest_first(folders):
                     try:
-                        return walk(folder, rest[k:])
+                        hit = walk(folder, rest[k:])
+                        results[hit.id] = hit
                     except NotFound as exc:
                         deepest = deepest or exc
+                if len(results) == 1:
+                    return next(iter(results.values()))
+                if len(results) > 1:
+                    listing = "; ".join(f"{i.type} {i.id} ({self.path(i.id)})" for i in results.values())
+                    raise InvalidRequest(
+                        f"{len(results)} items match {ref!r} (folders called {name!r} share a name): "
+                        f"{listing}. Use an id instead."
+                    )
             raise deepest or NotFound(f"nothing called {rest[0]!r} in {self.path(parent.id)}")
 
         return walk(start, parts) if parts else start
@@ -305,12 +319,15 @@ class Library:
         if len(parts) > MAX_FOLDER_DEPTH:
             raise InvalidRequest(f"folder paths are limited to {MAX_FOLDER_DEPTH} levels")
         current: Item = ROOT_ITEM
-        while parts:
-            same = [i for i in self.children(current.id) if i.is_folder and i.name == parts[0]]
-            if not same:
-                break
-            current = sorted(same, key=lambda i: -(i.last_modified.timestamp() if i.last_modified else 0))[0]
-            parts = parts[1:]
+        for k in range(len(parts) - 1, 0, -1):  # deepest existing prefix, matched like resolve()
+            try:
+                prefix = self.resolve("/" + "/".join(parts[:k]), kind="folder")
+            except NotFound:
+                continue
+            if not prefix.is_folder:
+                raise InvalidRequest(f"{self.path(prefix.id)} is a document, not a folder")
+            current, parts = prefix, parts[k:]
+            break
         changes, parent = [], current.id
         for part in parts:
             folder_id = xochitl.new_id()
@@ -660,12 +677,13 @@ class Library:
         scale: float = 1.0,
         background: bool = True,
         crop: str | None = None,
-        max_height: float | None = None,
+        max_screens: float | None = None,
     ) -> list[RenderedPage]:
         """Render several pages, reading the page list, the PDF and the ``.rm`` files once.
 
-        ``max_height`` (tablet pixels) cuts off pages scrolled extremely far down;
-        :attr:`RenderedPage.truncated` tells when that happened.
+        ``max_screens`` limits how far a page may extend, in page heights down and
+        page widths to each side, so a page scrolled (or scribbled) absurdly far
+        cannot exhaust memory. :attr:`RenderedPage.truncated` tells when that happened.
         """
         if fmt not in ("svg", "png", "pdf"):
             raise InvalidRequest("format must be svg, png or pdf")
@@ -699,20 +717,25 @@ class Library:
                 continue
 
             mode = crop or ("page" if has_pdf else "content")
-            box = render.page_box(page_scene, mode)
-            truncated = max_height is not None and box[3] - box[1] > max_height
-            if truncated:
-                box = (box[0], box[1], box[2], box[1] + float(max_height))  # type: ignore[arg-type]
+            x0, y0, x1, y1 = render.page_box(page_scene, mode)
+            truncated = False
+            if max_screens is not None:
+                w, h = float(page_scene.width), float(page_scene.height)
+                limited = (max(x0, -w * max_screens), max(y0, -h), min(x1, w * (1 + max_screens)),
+                           min(y1, max(y0, -h) + h * max_screens))
+                truncated = limited != (x0, y0, x1, y1)
+                x0, y0, x1, y1 = limited
+            box = (x0, y0, x1, y1)
             bg_image = bg_box = None
             if has_pdf and background:
-                bg_box = _pdf_box_on_screen(source_pdf, ref.source_page, page_scene)  # type: ignore[arg-type]
                 k = 2 * min(scale, 1.0)
-                try:
+                try:  # a page pointing past the end of its PDF still renders its ink
+                    bg_box = _pdf_box_on_screen(source_pdf, ref.source_page, page_scene)  # type: ignore[arg-type]
                     bg_image = rmpdf.rasterize_page(
                         source_pdf, ref.source_page,  # type: ignore[arg-type]
                         (max(1, round(bg_box[2] * k)), max(1, round(bg_box[3] * k))),
                     )
-                except Exception as exc:  # noqa: BLE001 - a broken PDF page still renders its ink
+                except Exception as exc:  # noqa: BLE001
                     log.warning("could not rasterize page: %s", exc)
                 if bg_image is None:
                     bg_box = None
@@ -827,7 +850,7 @@ class Library:
         self._check_parent(parent, allow_trash=True)
         records = self._records()
         changes = []
-        for item_id in item_ids:
+        for item_id in dict.fromkeys(item_ids):
             rec = records.get(item_id)
             if rec is None:
                 raise NotFound(f"no document or folder with id {item_id!r}")
@@ -865,16 +888,34 @@ def _looks_like_uuid(value: str) -> bool:
         return False
 
 
-def validate_upload(data: bytes, filename: str) -> str:
-    """Check that ``data`` is an uploadable PDF, EPUB or archive; return its extension."""
+def validate_upload(data: bytes, filename: str, *, max_unpacked: int = DEFAULT_MAX_UNPACKED) -> str:
+    """Check that ``data`` can be uploaded as ``filename``; return its extension.
+
+    Runs every check the upload itself would fail on, so callers can validate
+    before creating destination folders.
+    """
     ext = PurePosixPath(filename).suffix.lower().lstrip(".")
     if ext in ("rmdoc", "zip"):
-        if not data.startswith(b"PK"):
-            raise InvalidRequest("this does not look like a .rmdoc/.zip archive")
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(data))
+        except zipfile.BadZipFile as exc:
+            raise InvalidRequest("not a valid .rmdoc/.zip archive") from exc
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        if len(infos) > MAX_ARCHIVE_ENTRIES:
+            raise InvalidRequest(f"archive has more than {MAX_ARCHIVE_ENTRIES} files")
+        if sum(i.file_size for i in infos) > max_unpacked:
+            raise InvalidRequest(f"archive unpacks to more than {max_unpacked // (1024 * 1024)} MB")
+        if len({xochitl.doc_id_of(i.filename) for i in infos if i.filename.endswith(".content")}) != 1:
+            raise InvalidRequest("archive must contain exactly one <id>.content file")
         return ext
     if ext not in xochitl.SOURCE_EXTENSIONS:
         raise InvalidRequest(f"unsupported file type .{ext}: upload a PDF, EPUB or .rmdoc")
     _check_magic(data, ext)
+    if ext == "pdf":
+        try:
+            rmpdf.page_count(data)
+        except Exception as exc:  # noqa: BLE001 - pypdf raises many types
+            raise InvalidRequest(f"this PDF could not be read: {exc}") from exc
     return ext
 
 

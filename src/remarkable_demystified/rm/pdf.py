@@ -26,6 +26,7 @@ from pypdf.generic import (
     DictionaryObject,
     FloatObject,
     NameObject,
+    NumberObject,
     RectangleObject,
 )
 
@@ -222,12 +223,26 @@ def _clip_contents(writer: PdfWriter, page: PageObject, rect: RectangleObject) -
     page[NameObject("/Contents")] = writer._add_object(stream)
 
 
+def _hide_annotations_outside(page: PageObject, rect: RectangleObject) -> None:
+    """Set the Hidden flag on annotations the old crop box kept out of view."""
+    for ref in page.get("/Annots") or []:
+        annot = ref.get_object()
+        r = annot.get("/Rect")
+        if not r or len(r) != 4:
+            continue
+        ax0, ax1 = sorted((float(r[0]), float(r[2])))
+        ay0, ay1 = sorted((float(r[1]), float(r[3])))
+        if ax1 < float(rect.left) or ax0 > float(rect.right) or ay1 < float(rect.bottom) or ay0 > float(rect.top):
+            annot[NameObject("/F")] = NumberObject(int(annot.get("/F", 0)) | 2)
+
+
 def _draw(writer: PdfWriter, page: PageObject, scene: PageScene, t: Transform) -> None:
     """Merge ``scene`` onto ``page``, growing the page if ink spills over its edges."""
     old_crop = RectangleObject(page.cropbox)
     box = _grown_box(old_crop, scene, t)
     if box != old_crop:
         _clip_contents(writer, page, old_crop)
+        _hide_annotations_outside(page, old_crop)
         page.mediabox = _union(page.mediabox, box)
         page.cropbox = box
         for name in ("/TrimBox", "/BleedBox", "/ArtBox"):
@@ -276,7 +291,10 @@ def notebook_pdf(scenes: Sequence[PageScene | None], *, grow: bool = True) -> by
         if scene is None:
             writer.add_blank_page(width=xochitl.RM2_WIDTH * PX_TO_PT, height=xochitl.RM2_HEIGHT * PX_TO_PT)
             continue
-        x0, y0, x1, y1 = scene.bounds() if grow else (0.0, 0.0, float(scene.width), float(scene.height))
+        if grow:
+            x0, y0, x1, y1 = scene.bounds(tolerance=GROW_TOLERANCE_PT / PX_TO_PT)
+        else:
+            x0, y0, x1, y1 = 0.0, 0.0, float(scene.width), float(scene.height)
         w, h = (x1 - x0) * PX_TO_PT, (y1 - y0) * PX_TO_PT
         page = writer.add_blank_page(width=w, height=h)
         t = Transform(PX_TO_PT, -x0 * PX_TO_PT, h + y0 * PX_TO_PT)
@@ -328,7 +346,7 @@ MAX_RASTER_PIXELS = 40_000_000
 def _raster_scale(page_w: float, page_h: float, size_px: tuple[int, int]) -> float:
     """Pixels per point to fit ``size_px``, capped by :data:`MAX_RASTER_PIXELS`."""
     scale = min(size_px[0] / page_w, size_px[1] / page_h)
-    return max(0.01, min(scale, (MAX_RASTER_PIXELS / (page_w * page_h)) ** 0.5))
+    return max(1e-6, min(scale, (MAX_RASTER_PIXELS / (page_w * page_h)) ** 0.5))
 
 
 def rasterize_page(pdf: bytes, index: int, size_px: tuple[int, int]):

@@ -477,9 +477,14 @@ class CloudStorage(DocumentStorage):
                     files = dict(old.files) if old else {}
                     for name in change.remove:
                         files.pop(name, None)
-                    def current(name: str, files: dict[str, IndexEntry] = files) -> bytes | None:
+                    def current(name: str, files: dict[str, IndexEntry] = files,
+                                blobs: dict[str, tuple[str, bytes]] = blobs) -> bytes | None:
                         entry = files.get(name)
-                        return self.get_blob(entry.hash, name) if entry else None
+                        if entry is None:
+                            return None
+                        if entry.hash in blobs:  # written earlier in this same batch
+                            return blobs[entry.hash][1]
+                        return self.get_blob(entry.hash, name)
 
                     writes = resolved_writes(change, current)  # against the freshly synced tree
                     for name, data in writes.items():

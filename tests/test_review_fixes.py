@@ -355,3 +355,190 @@ def test_S9_strict_host_key_setting(monkeypatch, tmp_path):
 
 def test_make_pdf_helper_still_used():
     assert make_pdf(1).startswith(b"%PDF")
+
+
+# == second review round (Sonnet recheck) ================================================
+
+
+def test_R1b_notebook_pages_ignore_edge_touching_ink(library, xochitl_dir):
+    page = make_v5_lines([(4, 0, [(100, 300), (1404, 300)]), (4, 0, [(100, 1872), (900, 1872)])])
+    (xochitl_dir / LEGACY_ID / "l-1.rm").write_bytes(page)
+    box = PdfReader(io.BytesIO(library.export_pdf(LEGACY_ID))).pages[0].mediabox
+    assert float(box.width) == pytest.approx(1404 * 72 / 226, abs=0.01)
+    assert float(box.height) == pytest.approx(1872 * 72 / 226, abs=0.01)
+
+
+def test_R3b_annotations_outside_the_old_crop_box_stay_hidden():
+    from pypdf.generic import ArrayObject, DictionaryObject, FloatObject
+
+    src = PdfWriter()
+    page = src.add_blank_page(width=1224, height=792)
+    page.cropbox = RectangleObject([0, 0, 612, 792])
+    stamp = DictionaryObject({
+        NameObject("/Type"): NameObject("/Annot"), NameObject("/Subtype"): NameObject("/Stamp"),
+        NameObject("/Rect"): ArrayObject([FloatObject(v) for v in (700, 300, 800, 400)]),
+    })
+    page[NameObject("/Annots")] = ArrayObject([src._add_object(stamp)])
+    buf = io.BytesIO()
+    src.write(buf)
+    ink = scene.parse(make_v5_lines([(4, 0, [(1000, 300), (2300, 300)])]))
+    out = PdfReader(io.BytesIO(rmpdf.annotate_pdf(buf.getvalue(), [(0, ink)]))).pages[0]
+    assert float(out.cropbox.right) > 612
+    assert int(out["/Annots"][0].get_object()["/F"]) & 2
+
+
+def test_S3b_raster_budget_has_no_floor_bypass():
+    for w, h in ((5e6, 5e6), (3e6, 100)):
+        scale = rmpdf._raster_scale(w, h, (2387, 2387))
+        assert w * h * scale * scale <= rmpdf.MAX_RASTER_PIXELS * 1.0001
+
+
+def test_S4b_ink_far_to_the_side_is_capped(library, xochitl_dir):
+    (xochitl_dir / LEGACY_ID / "l-1.rm").write_bytes(make_v5_lines([(4, 0, [(100, 100), (100000, 100)])]))
+    result = call(build_server(library), "view_pages", {"document_path": "/Legacy sketch"})
+    imgs = images(result)
+    assert 1 <= len(imgs) <= 8 and all(max(i.size) <= 1568 for i in imgs)
+    assert any("ink further out than can be shown" in b.text for b in result.content if b.type == "text")
+
+
+def test_N8_tall_pages_never_need_unreachable_parts(library, xochitl_dir):
+    (xochitl_dir / LEGACY_ID / "l-1.rm").write_bytes(
+        make_v5_lines([(4, 0, [(100, 100), (900, 100)]), (4, 0, [(100, 15500), (900, 15500)])]))
+    result = call(build_server(library), "view_pages", {"document_path": "/Legacy sketch"})
+    texts = [b.text for b in result.content if b.type == "text"]
+    assert len(images(result)) <= 8
+    assert not any("parts fit in this call" in t for t in texts)
+    assert any("ink further out" in t for t in texts)
+
+
+def test_S5b_failed_creates_leave_no_folders(library, tmp_path):
+    server = build_server(library, allow_write=True)
+    bad = tmp_path / "bad.rmdoc"
+    bad.write_bytes(b"PK\x03\x04garbage")
+    assert call(server, "upload_file", {"local_path": str(bad), "folder_path": "/junk2/a"}).is_error
+    pdf = tmp_path / "ok.pdf"
+    pdf.write_bytes(make_pdf(1))
+    assert call(server, "upload_file", {"local_path": str(pdf), "folder_path": "/junk3", "name": "   "}).is_error
+    result = call(server, "create_notebook", {"name": "  ", "folder_path": "/junk4"})
+    assert result.is_error and "name must not be empty" in result.content[0].text
+    for junk in ("/junk2", "/junk3", "/junk4"):
+        with pytest.raises(NotFound):
+            library.resolve(junk)
+
+
+def test_N4_ensure_folder_matches_like_resolve(library):
+    sub = library.ensure_folder("/books/NewSub")  # existing "Books", different case
+    assert library.path(sub.id) == "/Books/NewSub"
+    assert [i.name for i in library.children("") if i.is_folder] == ["Books"]
+    meeting = library.create_folder("Meeting 10/10")
+    inner = library.ensure_folder("/Meeting 10/10/Sub")
+    assert inner.parent == meeting.id
+    with pytest.raises(InvalidRequest, match="is a document"):
+        library.ensure_folder("/Notes/Sub")
+
+
+def test_N5_N6_N7_resolve_messages_dots_and_ambiguity(library):
+    with pytest.raises(NotFound, match="/Notes is a document, not a folder"):
+        library.resolve("/Notes/Page")
+    assert library.resolve(".").id == ""
+    assert library.resolve("./Books").id == FOLDER_ID
+    assert library.resolve("Books/./Paper").id == PDF_ID
+    a = library.create_folder("Dup")
+    b = library.create_folder("Dup")
+    library.create_folder("Inner", a.id)
+    library.create_folder("Inner", b.id)
+    with pytest.raises(InvalidRequest, match="2 items match '/Dup/Inner'"):
+        library.resolve("/Dup/Inner")
+    only = library.create_folder("Only", b.id)
+    assert library.resolve("/Dup/Only").id == only.id  # unique below duplicates: fine
+
+
+def test_N1_render_survives_pages_beyond_the_pdf(library):
+    library.replace_source(PDF_ID, make_pdf(1), "shorter.pdf")
+    data, media = library.render_page(PDF_ID, 2, "png", scale=0.2)
+    assert media == "image/png" and data.startswith(b"\x89PNG")
+    assert not call(build_server(library), "view_pages",
+                    {"document_path": "/Books/Paper", "first_page": 1, "count": 4}).is_error
+
+
+def test_N2_patches_never_invent_or_wipe_documents(library, xochitl_dir):
+    from remarkable_demystified.errors import RemarkableError
+
+    ghost = "99999999-9999-4999-8999-999999999999"
+    with pytest.raises(NotFound):
+        library.storage.apply([DocChange(ghost, patch={
+            xochitl.metadata_name(ghost): lambda m: xochitl.updated_metadata(m, parent="trash"),
+        })])
+    assert not list(xochitl_dir.glob(f"{ghost}*"))
+    meta = xochitl_dir / f"{NOTEBOOK_ID}.metadata"
+    meta.write_text("{not json")
+    with pytest.raises(RemarkableError, match="not valid JSON"):
+        library.storage.apply([DocChange(NOTEBOOK_ID, patch={
+            xochitl.metadata_name(NOTEBOOK_ID): lambda m: xochitl.updated_metadata(m, pinned=True),
+        })])
+    assert meta.read_text() == "{not json"
+
+
+def test_N3_cloud_batch_move_with_duplicates(xochitl_dir, tmp_path):
+    from fake_cloud import FakeCloud
+    from test_cloud import make_storage
+
+    from remarkable_demystified.library import Library
+
+    fake = FakeCloud()
+    fake.seed_from_dir(xochitl_dir)
+    lib = Library(make_storage(fake, tmp_path))
+    moved = lib.batch_move([PDF_ID, PDF_ID, NOTEBOOK_ID], "")
+    assert [m.id for m in moved] == [PDF_ID, NOTEBOOK_ID]
+    assert json.loads(fake.documents()[PDF_ID][f"{PDF_ID}.metadata"])["parent"] == ""
+
+
+def test_N9_browse_marks_cut_short_folders(library):
+    big = library.create_folder("Big")
+    changes = []
+    for i in range(120):
+        sub_id = xochitl.new_id()
+        changes.append(DocChange(sub_id, write={
+            xochitl.content_name(sub_id): xochitl.dumps(xochitl.folder_content()),
+            xochitl.metadata_name(sub_id): xochitl.dumps(xochitl.new_metadata(f"sub{i:03}", big.id, xochitl.COLLECTION)),
+        }))
+        for j in range(2):
+            doc_id = xochitl.new_id()
+            changes.append(DocChange(doc_id, write={
+                xochitl.content_name(doc_id): xochitl.dumps(xochitl.new_content("notebook")),
+                xochitl.metadata_name(doc_id): xochitl.dumps(xochitl.new_metadata(f"doc{i:03}-{j}", sub_id)),
+            }))
+    library.storage.apply(changes)
+    server = build_server(library)
+    first = json.loads(call(server, "browse", {"path": "/Big", "depth": 2}).content[0].text)
+    last = first["items"][-1]
+    complete = [e for e in first["items"] if not e.get("items_truncated")]
+    assert len(complete) == len(first["items"]) - (1 if last.get("items_truncated") else 0)
+    resume = int(first["note"].split("offset=")[1].split()[0])
+    assert resume == len(complete)  # the cut-off folder is listed again from its start
+    again = json.loads(call(server, "browse", {"path": "/Big", "depth": 2, "offset": resume}).content[0].text)
+    assert again["items"][0]["name"] == first["items"][len(complete)]["name"]
+    flat = json.loads(call(build_server(library), "browse", {"path": "/Big"}).content[0].text)
+    assert len(flat["items"]) == 120 and "note" not in flat  # under the cap: no false note
+
+
+def test_N10_print_config_edge_cases(tmp_path, monkeypatch, capsys):
+    from remarkable_demystified.cli import main
+
+    for key in list(__import__("os").environ):
+        if key.startswith("RMD_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("RMD_KNOWN_HOSTS", "")
+    assert main(["mcp", "--print-config"]) == 0  # used to crash on the empty path
+    assert json.loads(capsys.readouterr().out)["mcpServers"]["remarkable"]["env"]["RMD_KNOWN_HOSTS"] == ""
+    cfg = tmp_path / "c1.toml"
+    cfg.write_text('[ssh]\nhost = "192.168.1.5"\n')
+    assert main(["--config", str(cfg), "mcp", "--print-config", "--host", "10.11.99.1"]) == 0
+    env = json.loads(capsys.readouterr().out)["mcpServers"]["remarkable"]["env"]
+    assert env["RMD_SSH_HOST"] == "10.11.99.1"  # the flag wins over the file, even when it is the default
+
+
+def test_N12_page_counts():
+    assert xochitl.page_refs({"fileType": "pdf", "pageCount": float("inf")}) == []
+    assert len(xochitl.page_refs({"fileType": "pdf"}, source_page_count=12000)) == 12000

@@ -66,10 +66,13 @@ export RMD_SSH_HOST=192.168.1.42      # the Wi-Fi address from the Copyrights sc
 ([official docs](https://developer.remarkable.com/documentation/developer-mode),
 [community guide](https://remarkable.guide/guide/access/ssh.html))
 
-On shared networks (campus Wi-Fi), make the first connection over the cable: `rmd` remembers
-the tablet's host key (it logs the fingerprint the first time) and refuses a different key
-later. Set `RMD_SSH_STRICT_HOST_KEY=true` to refuse unknown keys outright, and prefer an SSH
-key (`RMD_SSH_KEY`) over the password.
+On shared networks (campus Wi-Fi), mind the host key: `rmd` remembers the tablet's key for
+each address the first time it connects (logging its fingerprint) and refuses a different
+key later. Keys are stored per address, so pin the Wi-Fi address itself, ideally from a
+network you trust, or add it while on the cable:
+`ssh-keyscan 192.168.1.42 >> ~/.config/remarkable-demystified/known_hosts`. Then set
+`RMD_SSH_STRICT_HOST_KEY=true` to refuse unknown keys outright, and prefer an SSH key
+(`RMD_SSH_KEY`) over the password.
 
 When something changes over SSH, `rmd` briefly stops the tablet UI (`xochitl`),
 writes the files, and starts it again so the tablet sees the change. That is the

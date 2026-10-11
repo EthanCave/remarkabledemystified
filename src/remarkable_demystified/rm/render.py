@@ -128,7 +128,7 @@ def to_image(
     canvas = Image.new("RGB", size, "white")
     if background is not None:
         bx, by, bw, bh = background_box or (0, 0, scene.width, scene.height)
-        bg = background.convert("RGB").resize((round(bw * k), round(bh * k)), Image.Resampling.LANCZOS)
+        bg = background.convert("RGB").resize((max(1, round(bw * k)), max(1, round(bh * k))), Image.Resampling.LANCZOS)
         canvas.paste(bg, (round((bx - x0) * k), round((by - y0) * k)))
 
     def tx(x: float, y: float) -> tuple[float, float]:
