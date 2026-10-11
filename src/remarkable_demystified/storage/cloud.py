@@ -48,7 +48,7 @@ import httpx
 
 from .. import xochitl
 from ..errors import AuthError, Conflict, ConnectionFailed, NotFound, RemarkableError
-from .base import DocChange, DocumentRecord, DocumentStorage
+from .base import DocChange, DocumentRecord, DocumentStorage, resolved_writes
 
 log = logging.getLogger(__name__)
 
@@ -477,7 +477,12 @@ class CloudStorage(DocumentStorage):
                     files = dict(old.files) if old else {}
                     for name in change.remove:
                         files.pop(name, None)
-                    for name, data in change.write.items():
+                    def current(name: str, files: dict[str, IndexEntry] = files) -> bytes | None:
+                        entry = files.get(name)
+                        return self.get_blob(entry.hash, name) if entry else None
+
+                    writes = resolved_writes(change, current)  # against the freshly synced tree
+                    for name, data in writes.items():
                         if not xochitl.is_safe_file_name(change.doc_id, name):
                             raise RemarkableError(f"{name!r} is not a valid file of {change.doc_id}")
                         h = hashlib.sha256(data).hexdigest()
@@ -493,10 +498,10 @@ class CloudStorage(DocumentStorage):
                     meta = files.get(xochitl.metadata_name(change.doc_id))
                     new = _Doc(doc_hash, sum(f.size for f in files.values()), files,
                                old.metadata if old else {}, old.content if old else {})
-                    if xochitl.metadata_name(change.doc_id) in change.write:
-                        new.metadata = xochitl.loads(change.write[xochitl.metadata_name(change.doc_id)])
-                    if xochitl.content_name(change.doc_id) in change.write:
-                        new.content = xochitl.loads(change.write[xochitl.content_name(change.doc_id)])
+                    if xochitl.metadata_name(change.doc_id) in writes:
+                        new.metadata = xochitl.loads(writes[xochitl.metadata_name(change.doc_id)])
+                    if xochitl.content_name(change.doc_id) in writes:
+                        new.content = xochitl.loads(writes[xochitl.content_name(change.doc_id)])
                     if meta is None:
                         raise RemarkableError(f"document {change.doc_id} would have no .metadata")
                     docs[change.doc_id] = new

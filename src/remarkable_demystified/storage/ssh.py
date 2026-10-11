@@ -14,6 +14,7 @@ import logging
 import shlex
 import threading
 from collections.abc import Iterable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,7 @@ import paramiko
 
 from .. import xochitl
 from ..errors import AuthError, ConnectionFailed, InvalidRequest, NotFound, RemarkableError
-from .base import DocChange, DocumentRecord, DocumentStorage
+from .base import DocChange, DocumentRecord, DocumentStorage, resolved_writes
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +82,7 @@ class SSHStorage(DocumentStorage):
             if self.known_hosts and self.known_hosts.exists():
                 client.load_host_keys(str(self.known_hosts))
             client.set_missing_host_key_policy(
-                paramiko.RejectPolicy() if self.strict_host_key else paramiko.AutoAddPolicy()
+                paramiko.RejectPolicy() if self.strict_host_key else _TrustOnFirstUse()
             )
             try:
                 client.connect(
@@ -106,7 +107,14 @@ class SSHStorage(DocumentStorage):
                     "SSH login refused. The root password is shown on the tablet under "
                     "Settings > Help > Copyrights and licenses (Paper Pro: enable developer mode)."
                 ) from exc
-            except (TimeoutError, OSError, paramiko.SSHException) as exc:
+            except paramiko.SSHException as exc:
+                if self.strict_host_key and "not found in known_hosts" in str(exc):
+                    raise ConnectionFailed(
+                        f"{self.host} is not in {self.known_hosts} and strict host key checking is on. "
+                        "Connect once with it off (over USB) or add the key with ssh-keyscan."
+                    ) from exc
+                raise ConnectionFailed(f"Cannot reach the tablet at {self.host}:{self.port}: {exc}") from exc
+            except (TimeoutError, OSError) as exc:
                 raise ConnectionFailed(f"Cannot reach the tablet at {self.host}:{self.port}: {exc}") from exc
             if self.known_hosts:
                 self.known_hosts.parent.mkdir(parents=True, exist_ok=True)
@@ -268,7 +276,9 @@ class SSHStorage(DocumentStorage):
                         f"cd {shlex.quote(self.dir)} && while IFS= read -r f; do rm -f \"$f\"; done",
                         ("\n".join(sorted(change.remove)) + "\n").encode(),
                     )
-                ordered = sorted(change.write.items(), key=lambda kv: kv[0].endswith(".metadata"))
+                # Patches read the files now that xochitl has stopped and saved its state.
+                writes = resolved_writes(change, partial(self._read_or_none, change.doc_id))
+                ordered = sorted(writes.items(), key=lambda kv: kv[0].endswith(".metadata"))
                 for name, data in ordered:
                     _check_name(change.doc_id, name)
                     final = f"{self.dir}/{name}"
@@ -278,6 +288,12 @@ class SSHStorage(DocumentStorage):
         finally:
             if stopped:
                 self.run("systemctl start xochitl", check=False)
+
+    def _read_or_none(self, doc_id: str, name: str) -> bytes | None:
+        try:
+            return self.read_file(doc_id, name)
+        except NotFound:
+            return None
 
     def restart_ui(self) -> None:
         """Restart xochitl so it picks up files changed behind its back."""
@@ -322,6 +338,20 @@ echo "xochitl=$(systemctl is-active xochitl 2>/dev/null)"
                     pass
             info[key] = value
         return info
+
+
+class _TrustOnFirstUse(paramiko.MissingHostKeyPolicy):
+    """Accept an unknown tablet's host key, and say so with its fingerprint (like ssh does).
+
+    Compare it with ``ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`` on the tablet,
+    or set ``ssh_strict_host_key`` to refuse unknown keys altogether.
+    """
+
+    def missing_host_key(self, client: paramiko.SSHClient, hostname: str, key: paramiko.PKey) -> None:
+        log.warning(
+            "trusting new SSH host key for %s: %s %s", hostname, key.get_name(), key.fingerprint
+        )
+        client.get_host_keys().add(hostname, key.get_name(), key)
 
 
 def _check_id(doc_id: str) -> None:

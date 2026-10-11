@@ -91,7 +91,15 @@ def test_usb_backend_only_offers_what_it_can_do():
     tablet = FakeTablet()
     lib = UsbWebLibrary(UsbWebStorage(client=httpx.Client(transport=httpx.MockTransport(tablet.handler))))
     names = {t.name for t in run(build_server(lib, allow_write=True), lambda c: c.list_tools()).tools}
-    assert names == {"browse", "find", "recent", "current", "device_info", "upload_file"}
+    assert names == {"browse", "find", "device_info", "upload_file"}  # no last-opened data over USB
+
+    async def get(c):
+        return c.instructions
+
+    text_ = run(build_server(lib, allow_write=True), get)
+    for missing in ("view_pages", "read_document", "move_many", "restore"):
+        assert missing not in text_  # instructions only mention tools that exist
+    assert "cannot tell which document is open" in text_
 
 
 # -- reading -------------------------------------------------------------------
@@ -135,7 +143,7 @@ def test_read_document(library):
     pdf = text(call(server, "read_document", {"document_path": "/Books/Paper", "pages": "1"}))
     assert "> The reMarkable uses electronic paper" in pdf
     empty = text(call(server, "read_document", {"document_path": "/Books/Paper", "pages": "3"}))
-    assert "Pages [3] have handwriting: use view_pages" in empty
+    assert "Pages 3 have handwriting: use view_pages" in empty
     bad = call(server, "read_document", {"document_path": "/Books/Paper", "pages": "2-9"})
     assert bad.is_error and "between 1 and 4" in bad.content[0].text
 
@@ -174,7 +182,12 @@ def test_view_pages_tiles_tall_scrolled_pages(library, xochitl_dir):
 
 def test_view_pages_caps_and_validates(library):
     server = build_server(library, max_pages_per_call=1)
-    assert len(images(call(server, "view_pages", {"document_path": "/Books/Paper", "count": 4}))) == 1
+    too_many = call(server, "view_pages", {"document_path": "/Books/Paper", "count": 4})
+    assert too_many.is_error and "less than or equal to 1" in too_many.content[0].text
+    one = call(server, "view_pages", {"document_path": "/Books/Paper"})
+    assert len(images(one)) == 1
+    notes = [b.text for b in one.content if b.type == "text"]
+    assert notes[-1] == "[Showed pages 1-1 of 4. At most 1 pages per call; continue with first_page=2.]"
     bad = call(server, "view_pages", {"document_path": "/Books/Paper", "first_page": 9})
     assert bad.is_error and "between 1 and 4" in bad.content[0].text
     folder = call(server, "view_pages", {"document_path": "/Books"})

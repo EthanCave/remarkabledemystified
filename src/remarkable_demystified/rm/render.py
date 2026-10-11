@@ -36,8 +36,14 @@ def text_lines(text: TypedText):
             yield text.x + indent, y, (prefix if i == 0 else "") + line, size, weight
 
 
-def page_box(scene: PageScene, crop: str = "page") -> tuple[float, float, float, float]:
-    """``(x0, y0, x1, y1)``: the page itself, or grown to fit everything drawn on it."""
+Box = tuple[float, float, float, float]
+
+
+def page_box(scene: PageScene, crop: str | Box = "page") -> Box:
+    """``(x0, y0, x1, y1)`` to draw: the page itself (``"page"``), the page grown to fit
+    everything drawn on it (``"content"``), or an explicit box."""
+    if isinstance(crop, tuple):
+        return crop
     if crop == "content":
         return scene.bounds()
     return 0.0, 0.0, float(scene.width), float(scene.height)
@@ -49,7 +55,7 @@ def to_svg(
     background: bytes | None = None,
     background_mime: str = "image/png",
     background_box: tuple[float, float, float, float] | None = None,
-    crop: str = "content",
+    crop: str | Box = "content",
 ) -> str:
     """Render the page as an SVG document (units: tablet pixels)."""
     x0, y0, x1, y1 = page_box(scene, crop)
@@ -112,7 +118,7 @@ def to_image(
     scale: float = 1.0,
     background: Image.Image | None = None,
     background_box: tuple[float, float, float, float] | None = None,
-    crop: str = "content",
+    crop: str | Box = "content",
     supersample: int = 2,
 ) -> Image.Image:
     """Render the page to a Pillow image (RGB)."""
@@ -194,7 +200,7 @@ def to_png(
     scale: float = 1.0,
     background: Image.Image | None = None,
     background_box: tuple[float, float, float, float] | None = None,
-    crop: str = "content",
+    crop: str | Box = "content",
 ) -> bytes:
     buf = io.BytesIO()
     image = to_image(scene, scale=scale, background=background, background_box=background_box, crop=crop)

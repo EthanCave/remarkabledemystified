@@ -18,6 +18,7 @@ import io
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import cast
 
 from pypdf import PageObject, PdfReader, PdfWriter
 from pypdf.generic import (
@@ -164,21 +165,36 @@ def _overlay_page(writer: PdfWriter, scene: PageScene, t: Transform, box: Rectan
     return page
 
 
+#: Ink overflowing a page edge by less than this (points) does not grow the page: it is
+#: just the rounded end of a stroke drawn up to the border.
+GROW_TOLERANCE_PT = 3.0
+
+
 def _grown_box(box: RectangleObject, scene: PageScene, t: Transform) -> RectangleObject:
     """``box`` enlarged to hold any ink written past the edge of the page.
 
     The tablet lets you write beyond a PDF page's border (or scroll a page
     down). Exporting into the original box would cut those strokes off.
     """
-    ink = scene.ink_bounds()
     left, bottom, right, top = float(box.left), float(box.bottom), float(box.right), float(box.top)
+    # Pen ink only: where xochitl lays out typed text on PDF pages narrower than its
+    # text box is unknown, so typed text never resizes a PDF page.
+    ink = scene.ink_bounds(include_text=False)
     if ink is None:
         return RectangleObject([left, bottom, right, top])
     ax, ay = t(ink[0], ink[1])  # top-left of the ink, in PDF space (y up)
     bx, by = t(ink[2], ink[3])  # bottom-right
-    return RectangleObject([
-        min(left, ax, bx), min(bottom, ay, by), max(right, ax, bx), max(top, ay, by),
-    ])
+    ink_left, ink_right = min(ax, bx), max(ax, bx)
+    ink_bottom, ink_top = min(ay, by), max(ay, by)
+    if left - ink_left > GROW_TOLERANCE_PT:
+        left = ink_left
+    if ink_right - right > GROW_TOLERANCE_PT:
+        right = ink_right
+    if bottom - ink_bottom > GROW_TOLERANCE_PT:
+        bottom = ink_bottom
+    if ink_top - top > GROW_TOLERANCE_PT:
+        top = ink_top
+    return RectangleObject([left, bottom, right, top])
 
 
 def _union(a: RectangleObject, b: RectangleObject) -> RectangleObject:
@@ -188,15 +204,36 @@ def _union(a: RectangleObject, b: RectangleObject) -> RectangleObject:
     ])
 
 
+def _clip_contents(writer: PdfWriter, page: PageObject, rect: RectangleObject) -> None:
+    """Clip the page's existing drawing to ``rect``.
+
+    Growing a page's crop box would otherwise reveal whatever the PDF had
+    cropped away (the other half of a split scan, crop marks, ...).
+    """
+    contents = page.get_contents()
+    if contents is None:
+        return
+    clip = (
+        f"q {float(rect.left):.3f} {float(rect.bottom):.3f} {float(rect.width):.3f} "
+        f"{float(rect.height):.3f} re W n\n"
+    ).encode()
+    stream = DecodedStreamObject()
+    stream.set_data(clip + contents.get_data() + b"\nQ")
+    page[NameObject("/Contents")] = writer._add_object(stream)
+
+
 def _draw(writer: PdfWriter, page: PageObject, scene: PageScene, t: Transform) -> None:
     """Merge ``scene`` onto ``page``, growing the page if ink spills over its edges."""
-    box = _grown_box(page.cropbox, scene, t)
-    if box != page.cropbox:
+    old_crop = RectangleObject(page.cropbox)
+    box = _grown_box(old_crop, scene, t)
+    if box != old_crop:
+        _clip_contents(writer, page, old_crop)
         page.mediabox = _union(page.mediabox, box)
         page.cropbox = box
-        for name in ("/TrimBox", "/BleedBox", "/ArtBox"):  # stale boxes would re-crop in some viewers
-            if name in page:
-                del page[name]
+        for name in ("/TrimBox", "/BleedBox", "/ArtBox"):
+            if name in page:  # keep them meaningful: they now include the ink too
+                existing = cast(list, page[name].get_object())
+                page[NameObject(name)] = _union(RectangleObject(existing), box)
     page.merge_page(_overlay_page(writer, scene, t, box))
 
 
@@ -284,10 +321,21 @@ def page_sizes(pdf: bytes) -> list[tuple[float, float]]:
     return [(float(p.cropbox.width), float(p.cropbox.height)) for p in PdfReader(io.BytesIO(pdf)).pages]
 
 
-def rasterize_page(pdf: bytes, index: int, width_px: int):
-    """Render one PDF page to a Pillow image with pypdfium2, PyMuPDF or poppler.
+#: Upper bound on rasterized pixels, so a crafted or freakishly tall page cannot exhaust memory.
+MAX_RASTER_PIXELS = 40_000_000
 
-    Returns ``None`` when none of them is installed (pages then render on white).
+
+def _raster_scale(page_w: float, page_h: float, size_px: tuple[int, int]) -> float:
+    """Pixels per point to fit ``size_px``, capped by :data:`MAX_RASTER_PIXELS`."""
+    scale = min(size_px[0] / page_w, size_px[1] / page_h)
+    return max(0.01, min(scale, (MAX_RASTER_PIXELS / (page_w * page_h)) ** 0.5))
+
+
+def rasterize_page(pdf: bytes, index: int, size_px: tuple[int, int]):
+    """Render one PDF page to a Pillow image fitting ``size_px`` (width, height).
+
+    Uses pypdfium2, PyMuPDF or poppler, whichever is installed; returns ``None``
+    when none is (pages then render on white).
     """
     try:
         import pypdfium2  # optional: pip install 'remarkable-demystified[render]'
@@ -297,7 +345,8 @@ def rasterize_page(pdf: bytes, index: int, width_px: int):
         doc = pypdfium2.PdfDocument(pdf)
         try:
             page = doc[index]
-            image = page.render(scale=width_px / page.get_width()).to_pil().convert("RGB")
+            scale = _raster_scale(page.get_width(), page.get_height(), size_px)
+            image = page.render(scale=scale).to_pil().convert("RGB")
             page.close()
             return image
         finally:
@@ -312,7 +361,7 @@ def rasterize_page(pdf: bytes, index: int, width_px: int):
 
         fdoc = fitz.open(stream=pdf, filetype="pdf")
         fpage = fdoc[index]
-        zoom = width_px / fpage.rect.width
+        zoom = _raster_scale(fpage.rect.width, fpage.rect.height, size_px)
         pix = fpage.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
@@ -324,14 +373,16 @@ def rasterize_page(pdf: bytes, index: int, width_px: int):
         return None
     from PIL import Image
 
+    w, h = page_sizes(pdf)[index]
+    scale = _raster_scale(w, h, size_px)
     with tempfile.TemporaryDirectory() as tmp:
         src = f"{tmp}/in.pdf"
         with open(src, "wb") as f:
             f.write(pdf)
         subprocess.run(
             ["pdftoppm", "-f", str(index + 1), "-l", str(index + 1), "-png",
-             "-scale-to-x", str(width_px), "-scale-to-y", "-1", "-singlefile", src, f"{tmp}/out"],
+             "-scale-to-x", str(max(1, round(w * scale))), "-scale-to-y", str(max(1, round(h * scale))),
+             "-singlefile", src, f"{tmp}/out"],
             check=True, capture_output=True, timeout=60,
         )
         return Image.open(f"{tmp}/out.png").convert("RGB")
-

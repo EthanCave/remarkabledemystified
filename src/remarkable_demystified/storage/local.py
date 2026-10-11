@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .. import xochitl
 from ..errors import InvalidRequest, NotFound
-from .base import DocChange, DocumentRecord, DocumentStorage
+from .base import DocChange, DocumentRecord, DocumentStorage, resolved_writes
 
 
 def _safe_join(root: Path, doc_id: str, name: str) -> Path:
@@ -74,8 +74,14 @@ class LocalStorage(DocumentStorage):
                 continue
             for name in change.remove:
                 _safe_join(self.root, change.doc_id, name).unlink(missing_ok=True)
+
+            def current(name: str, doc_id: str = change.doc_id) -> bytes | None:
+                path = _safe_join(self.root, doc_id, name)
+                return path.read_bytes() if path.is_file() else None
+
+            writes = resolved_writes(change, current)
             # Write .metadata last so a half-written document never shows up.
-            for name, data in sorted(change.write.items(), key=lambda kv: kv[0].endswith(".metadata")):
+            for name, data in sorted(writes.items(), key=lambda kv: kv[0].endswith(".metadata")):
                 path = _safe_join(self.root, change.doc_id, name)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_name(path.name + ".tmp")

@@ -76,6 +76,9 @@ PALETTE: dict[int, tuple[int, int, int]] = {
     13: (247, 232, 81),    # yellow 2
 }
 
+#: Tools whose strokes leave nothing visible: the eraser paints white, erase-area is a lasso.
+INVISIBLE_TOOLS = ("eraser", "erase_area")
+
 #: Approximate line heights (px) of typed-text paragraph styles on 3.x firmware.
 LINE_HEIGHTS = {"heading": 150}
 DEFAULT_LINE_HEIGHT = 70
@@ -184,8 +187,8 @@ class PageScene:
     def is_empty(self) -> bool:
         return not (self.strokes or self.highlights or (self.text and self.text.paragraphs))
 
-    def ink_bounds(self) -> tuple[float, float, float, float] | None:
-        """``(x0, y0, x1, y1)`` of pen strokes and typed text; ``None`` if there are none.
+    def ink_bounds(self, *, include_text: bool = True) -> tuple[float, float, float, float] | None:
+        """``(x0, y0, x1, y1)`` of pen strokes (and typed text); ``None`` if there are none.
 
         PDF text highlights (``GlyphRange``) are left out on purpose: their
         rectangles do not seem to share the stroke coordinate frame (the real
@@ -194,14 +197,19 @@ class PageScene:
         xs: list[float] = []
         ys: list[float] = []
         for s in self.strokes:
+            if s.tool in INVISIBLE_TOOLS:
+                continue
             for p in s.points:
                 half = p.width / 2
                 xs += (p.x - half, p.x + half)
                 ys += (p.y - half, p.y + half)
-        if self.text:
+        if self.text and include_text:
             for para in self.text.paragraphs:
                 if para.text.strip():
-                    xs += (self.text.x, self.text.x + self.text.width)
+                    # estimated width of the longest line (+ room for a bullet), not the whole box
+                    longest = max(len(line) for line in para.lines)
+                    width = longest * CHAR_WIDTHS.get(para.style, DEFAULT_CHAR_WIDTH) + 40
+                    xs += (self.text.x, self.text.x + min(self.text.width, width))
                     # para.y is the first baseline; leave room for ascenders
                     ys += (para.y - line_height(para.style), para.y + line_height(para.style) * len(para.lines))
         if not xs:
@@ -292,7 +300,8 @@ def _parse_v6(data: bytes) -> PageScene:
     scene = PageScene(version=6)
     info = getattr(tree, "scene_info", None)
     paper = getattr(info, "paper_size", None) if info is not None else None
-    if paper and len(paper) == 2 and all(isinstance(v, int) and v > 0 for v in paper):
+    # Real tablets write 1404x1872, 1620x2160 or 954x1696; ignore anything absurd.
+    if paper and len(paper) == 2 and all(isinstance(v, int) and 500 <= v <= 5000 for v in paper):
         scene.width, scene.height = int(paper[0]), int(paper[1])
     center = scene.width / 2
 

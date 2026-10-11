@@ -66,6 +66,11 @@ export RMD_SSH_HOST=192.168.1.42      # the Wi-Fi address from the Copyrights sc
 ([official docs](https://developer.remarkable.com/documentation/developer-mode),
 [community guide](https://remarkable.guide/guide/access/ssh.html))
 
+On shared networks (campus Wi-Fi), make the first connection over the cable: `rmd` remembers
+the tablet's host key (it logs the fingerprint the first time) and refuses a different key
+later. Set `RMD_SSH_STRICT_HOST_KEY=true` to refuse unknown keys outright, and prefer an SSH
+key (`RMD_SSH_KEY`) over the password.
+
 When something changes over SSH, `rmd` briefly stops the tablet UI (`xochitl`),
 writes the files, and starts it again so the tablet sees the change. That is the
 standard approach used by community tools; set `RMD_SSH_RESTART=never` to skip it
@@ -104,6 +109,7 @@ host = "10.11.99.1"        # or the tablet's Wi-Fi address
 password = "the-password"
 # key = "~/.ssh/id_ed25519"
 # restart = "never"
+# strict_host_key = true   # refuse tablets whose host key isn't already known
 
 [server]
 api_token = "a-long-random-string"   # required by the REST API when set
@@ -122,17 +128,23 @@ flag > environment > config file > default.
 or any MCP client can browse your tablet and read your notes, **including handwriting**: it
 hands Claude images of the pages and Claude reads the ink itself (no OCR engine or API key).
 
-**Claude Desktop.** Print a ready-made entry and paste it into `claude_desktop_config.json`
-(Settings → Developer → Edit Config), then fill in the password and restart Claude:
+**Claude Desktop.** Print a ready-made entry (absolute paths, every setting it needs):
 
 ```bash
 rmd mcp --print-config               # add --allow-write to let Claude make changes
 ```
 
-**Claude Code.**
+Open `claude_desktop_config.json` (Settings → Developer → Edit Config) and add the
+`"remarkable"` entry inside the existing `"mcpServers"` object (create that object if the
+file has none), fill in the password, and restart Claude.
+
+**Claude Code.** Register it for all your projects, using the absolute path to `rmd` so it
+works even when the virtualenv isn't active:
 
 ```bash
-claude mcp add remarkable -e RMD_SSH_PASSWORD='the-password' -- rmd mcp
+claude mcp add --scope user remarkable \
+  -e RMD_SSH_PASSWORD='the-password' \
+  -- "$(command -v rmd)" mcp           # add -e RMD_SSH_HOST=192.168.1.42 for Wi-Fi
 ```
 
 Then ask things like *"What did I write in Tuesday's Algorithms lecture?"*, *"Summarize my
@@ -141,18 +153,21 @@ items on my last meeting page into a checklist notebook on my tablet."*
 
 | Tool | What it does |
 |---|---|
-| `browse`, `find`, `recent`, `current` | folders, name/tag search, recently opened, the page open right now |
-| `list_pages` | which pages have handwriting, and which PDF page each shows |
+| `browse`, `find`, `recent`, `current` | folders, name/tag search, recently opened, the page open right now (not over the USB web interface) |
+| `list_pages` | which pages have handwriting, and which PDF page each shows (in ranges of up to 500) |
 | `read_document` | typed text and highlights as Markdown; optionally the PDF's printed text |
-| `view_pages` | page images (handwriting, highlights, the PDF underneath) for Claude to read |
+| `view_pages` | page images (handwriting, highlights, the PDF underneath, ink past the page edge) for Claude to read; up to 4 pages per call |
 | `device_info` | battery, storage, firmware |
 | *with `--allow-write`:* `create_notebook`, `create_folder`, `organize`, `move_many`, `trash`, `restore`, `upload_file` | create, rename, move, favorite, tag, trash (reversible), upload |
 
 **Safety.** The server is read-only unless started with `--allow-write`, and even then it
 never offers permanent delete, emptying the trash, replacing files or raw file access.
-Claude is told to treat text inside your documents as content, not instructions. Over SSH
-each write briefly restarts the tablet's interface (closing the open document), so ask
-Claude to batch moves.
+Claude is told to treat text inside your documents as content, not instructions. With
+`--allow-write`, `upload_file` can send any PDF, EPUB or `.rmdoc` your account can read to
+the tablet (and Claude can then read it), so only enable writes in conversations you trust.
+Over SSH each write briefly restarts the tablet's interface (closing the open document), so
+ask Claude to batch moves. Edits are applied to the tablet's files as they are at that moment,
+so a page you just added is never lost to an edit made from an older listing.
 
 ---
 

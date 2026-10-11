@@ -245,29 +245,47 @@ def _common_options(default: object) -> argparse.ArgumentParser:
 
 
 def _mcp_client_config(args: argparse.Namespace, settings) -> dict[str, Any]:
-    """A ready-to-paste claude_desktop_config.json entry for this machine."""
+    """A claude_desktop_config.json entry for this machine.
+
+    Claude starts ``rmd`` with only this environment, from another working
+    directory, so every path is absolute and every non-default setting that does
+    not come from the config file is spelled out. The SSH password is never printed.
+    """
     import shutil
+
+    from .config import Settings, config_file_path
 
     exe = shutil.which("rmd")
     command, cli_args = (exe, ["mcp"]) if exe else (sys.executable, ["-m", "remarkable_demystified", "mcp"])
     if args.allow_write:
         cli_args.append("--allow-write")
+
+    def absolute(path: str) -> str:
+        return str(Path(path).expanduser().resolve())
+
+    defaults = Settings()
     env: dict[str, str] = {"RMD_BACKEND": settings.backend}
+    config_file = config_file_path(args.config)
+    if config_file.exists():
+        env["RMD_CONFIG"] = absolute(str(config_file))
     if settings.backend == "ssh":
-        if settings.ssh_host != "10.11.99.1":
-            env["RMD_SSH_HOST"] = settings.ssh_host
+        for name in ("ssh_host", "ssh_port", "ssh_user", "ssh_restart", "xochitl_dir"):
+            if getattr(settings, name) != getattr(defaults, name):
+                env[f"RMD_{name.upper()}"] = str(getattr(settings, name))
+        if settings.ssh_strict_host_key:
+            env["RMD_SSH_STRICT_HOST_KEY"] = "true"
+        env["RMD_KNOWN_HOSTS"] = absolute(settings.known_hosts)
         if settings.ssh_key:
-            env["RMD_SSH_KEY"] = settings.ssh_key
+            env["RMD_SSH_KEY"] = absolute(settings.ssh_key)
         elif not (read_config_file(args.config).get("ssh") or {}).get("password"):
-            # Claude launches rmd with only this environment, so the password must come
-            # from here or the config file. Never print the real one.
             env["RMD_SSH_PASSWORD"] = "<root password: Settings > Help > Copyrights and licenses>"
     elif settings.backend == "local" and settings.local_dir:
-        env["RMD_LOCAL_DIR"] = str(Path(settings.local_dir).expanduser().resolve())
-    elif settings.backend == "usb" and settings.usb_url != "http://10.11.99.1":
+        env["RMD_LOCAL_DIR"] = absolute(settings.local_dir)
+    elif settings.backend == "usb" and settings.usb_url != defaults.usb_url:
         env["RMD_USB_URL"] = settings.usb_url
-    if args.config:
-        env["RMD_CONFIG"] = str(Path(args.config).expanduser().resolve())
+    elif settings.backend == "cloud":
+        env["RMD_CLOUD_TOKEN_FILE"] = absolute(settings.cloud_token_file)
+        env["RMD_CACHE_DIR"] = absolute(settings.cache_dir)
     return {"mcpServers": {"remarkable": {"command": command, "args": cli_args, "env": env}}}
 
 

@@ -57,6 +57,8 @@ class Settings:
     ssh_password: str | None = None
     ssh_key: str | None = None
     ssh_restart: str = "auto"
+    #: Refuse tablets whose host key is not already in known_hosts (no trust-on-first-use).
+    ssh_strict_host_key: bool = False
     xochitl_dir: str = "/home/root/.local/share/remarkable/xochitl"
     known_hosts: str = field(default_factory=lambda: str(config_dir() / "known_hosts"))
 
@@ -91,6 +93,7 @@ _FILE_KEYS = {
     ("ssh", "restart"): "ssh_restart",
     ("ssh", "xochitl_dir"): "xochitl_dir",
     ("ssh", "known_hosts"): "known_hosts",
+    ("ssh", "strict_host_key"): "ssh_strict_host_key",
     ("local", "dir"): "local_dir",
     ("cloud", "token_file"): "cloud_token_file",
     ("cloud", "auth_host"): "cloud_auth_host",
@@ -103,6 +106,15 @@ _FILE_KEYS = {
 
 
 def _coerce(name: str, value: Any) -> Any:
+    if name == "ssh_strict_host_key":
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off", ""):
+            return False
+        raise InvalidRequest(f"{name} must be true or false, got {value!r}")
     if name in ("ssh_port", "max_upload_mb"):
         try:
             return int(value)
@@ -176,6 +188,7 @@ def connect(settings: Settings | None = None, **overrides: Any):
             xochitl_dir=settings.xochitl_dir,
             restart=settings.ssh_restart,
             known_hosts=settings.known_hosts,
+            strict_host_key=settings.ssh_strict_host_key,
         ))
     if settings.backend == "cloud":
         from .storage.cloud import CloudAuth, CloudStorage
