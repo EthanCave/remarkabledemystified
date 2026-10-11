@@ -160,7 +160,8 @@ class UsbWebLibrary(Library):
         # Only the rendered PDF is downloadable; for PDFs that is the original plus annotations.
         return self.export_pdf(item_id), "pdf"
 
-    def upload(self, data: bytes, filename: str, *, parent: str = xochitl.ROOT, name: str | None = None) -> Item:
+    def upload(self, data: bytes, filename: str, *, parent: str = xochitl.ROOT, name: str | None = None,
+               max_unpacked: int = 0) -> Item:
         ext = PurePosixPath(filename).suffix.lower().lstrip(".")
         if ext not in xochitl.SOURCE_EXTENSIONS:
             raise InvalidRequest("the USB web interface only accepts PDF and EPUB files")

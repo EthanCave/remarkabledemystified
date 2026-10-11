@@ -9,11 +9,15 @@ builds every higher-level operation (rename, upload, render, ...) on top of it.
 
 from __future__ import annotations
 
+import json
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
+
+from .. import xochitl
+from ..errors import NotFound, RemarkableError
 
 
 @dataclass
@@ -25,6 +29,9 @@ class DocumentRecord:
     content: dict[str, Any]
 
 
+JsonPatch = Callable[[dict[str, Any]], dict[str, Any]]
+
+
 @dataclass
 class DocChange:
     """A change to one document, applied atomically by :meth:`DocumentStorage.apply`.
@@ -32,12 +39,43 @@ class DocChange:
     ``write`` maps file names (relative to the xochitl directory, e.g.
     ``"<id>.metadata"`` or ``"<id>/<page>.rm"``) to their new bytes. ``remove``
     lists files to delete. ``delete`` removes the whole document.
+
+    ``patch`` maps JSON file names (``.metadata``, ``.content``) to functions that
+    turn the file's *current* contents into the new ones. Storages run them at
+    the last moment (over SSH: after the tablet UI has stopped and saved), so an
+    edit never overwrites something the tablet wrote in the meantime.
     """
 
     doc_id: str
     write: dict[str, bytes] = field(default_factory=dict)
     remove: set[str] = field(default_factory=set)
     delete: bool = False
+    patch: dict[str, JsonPatch] = field(default_factory=dict)
+
+
+def resolved_writes(change: DocChange, read_current: Callable[[str], bytes | None]) -> dict[str, bytes]:
+    """``change.write`` plus the result of each patch applied to the file as it is now.
+
+    A patch never invents a document: a missing ``.metadata`` means the document
+    was deleted meanwhile (:class:`NotFound`). A file that is not valid JSON is left
+    alone rather than replaced by a near-empty one.
+    """
+    writes = dict(change.write)
+    for name, fn in change.patch.items():
+        raw = read_current(name)
+        if raw is None or not raw.strip():
+            if name.endswith(".metadata"):
+                raise NotFound(f"document {change.doc_id} no longer exists")
+            current: dict[str, Any] = {}
+        else:
+            try:
+                current = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                current = None  # type: ignore[assignment]
+            if not isinstance(current, dict):
+                raise RemarkableError(f"{name} is not valid JSON; not changing it")
+        writes[name] = xochitl.dumps(fn(current))
+    return writes
 
 
 class DocumentStorage(ABC):
@@ -85,7 +123,7 @@ class DocumentStorage(ABC):
 
     def apply(self, changes: Iterable[DocChange]) -> None:
         """Apply a batch of document changes, then refresh the cached listing."""
-        changes = [c for c in changes if c.write or c.remove or c.delete]
+        changes = [c for c in changes if c.write or c.remove or c.delete or c.patch]
         if not changes:
             return
         try:

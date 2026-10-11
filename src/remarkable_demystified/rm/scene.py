@@ -76,6 +76,9 @@ PALETTE: dict[int, tuple[int, int, int]] = {
     13: (247, 232, 81),    # yellow 2
 }
 
+#: Tools whose strokes leave nothing visible: the eraser paints white, erase-area is a lasso.
+INVISIBLE_TOOLS = ("eraser", "erase_area")
+
 #: Approximate line heights (px) of typed-text paragraph styles on 3.x firmware.
 LINE_HEIGHTS = {"heading": 150}
 DEFAULT_LINE_HEIGHT = 70
@@ -184,17 +187,53 @@ class PageScene:
     def is_empty(self) -> bool:
         return not (self.strokes or self.highlights or (self.text and self.text.paragraphs))
 
-    def bounds(self) -> tuple[float, float, float, float]:
-        """``(x0, y0, x1, y1)`` covering the page and everything drawn on it."""
-        x0, y0, x1, y1 = 0.0, 0.0, float(self.width), float(self.height)
+    def ink_bounds(self, *, include_text: bool = True) -> tuple[float, float, float, float] | None:
+        """``(x0, y0, x1, y1)`` of pen strokes (and typed text); ``None`` if there are none.
+
+        PDF text highlights (``GlyphRange``) are left out on purpose: their
+        rectangles do not seem to share the stroke coordinate frame (the real
+        samples place them partly off the page), so they must not resize pages.
+        """
+        xs: list[float] = []
+        ys: list[float] = []
         for s in self.strokes:
+            if s.tool in INVISIBLE_TOOLS:
+                continue
             for p in s.points:
                 half = p.width / 2
-                x0, x1 = min(x0, p.x - half), max(x1, p.x + half)
-                y0, y1 = min(y0, p.y - half), max(y1, p.y + half)
-        if self.text:
+                xs += (p.x - half, p.x + half)
+                ys += (p.y - half, p.y + half)
+        if self.text and include_text:
             for para in self.text.paragraphs:
-                y1 = max(y1, para.y + line_height(para.style) * max(1, len(para.lines)))
+                if para.text.strip():
+                    # estimated width of the longest line (+ room for a bullet), not the whole box
+                    longest = max(len(line) for line in para.lines)
+                    width = longest * CHAR_WIDTHS.get(para.style, DEFAULT_CHAR_WIDTH) + 40
+                    xs += (self.text.x, self.text.x + min(self.text.width, width))
+                    # para.y is the first baseline; leave room for ascenders
+                    ys += (para.y - line_height(para.style), para.y + line_height(para.style) * len(para.lines))
+        if not xs:
+            return None
+        return min(xs), min(ys), max(xs), max(ys)
+
+    def bounds(self, tolerance: float = 0.0) -> tuple[float, float, float, float]:
+        """``(x0, y0, x1, y1)`` covering the page and everything drawn on it.
+
+        A side only grows when ink passes it by more than ``tolerance`` pixels, so a
+        stroke drawn up to the screen edge does not change the page size.
+        """
+        x0, y0, x1, y1 = 0.0, 0.0, float(self.width), float(self.height)
+        ink = self.ink_bounds()
+        if ink is None:
+            return x0, y0, x1, y1
+        if x0 - ink[0] > tolerance:
+            x0 = ink[0]
+        if y0 - ink[1] > tolerance:
+            y0 = ink[1]
+        if ink[2] - x1 > tolerance:
+            x1 = ink[2]
+        if ink[3] - y1 > tolerance:
+            y1 = ink[3]
         return x0, y0, x1, y1
 
 
@@ -273,7 +312,8 @@ def _parse_v6(data: bytes) -> PageScene:
     scene = PageScene(version=6)
     info = getattr(tree, "scene_info", None)
     paper = getattr(info, "paper_size", None) if info is not None else None
-    if paper and len(paper) == 2 and all(isinstance(v, int) and v > 0 for v in paper):
+    # Real tablets write 1404x1872, 1620x2160 or 954x1696; ignore anything absurd.
+    if paper and len(paper) == 2 and all(isinstance(v, int) and 500 <= v <= 5000 for v in paper):
         scene.width, scene.height = int(paper[0]), int(paper[1])
     center = scene.width / 2
 

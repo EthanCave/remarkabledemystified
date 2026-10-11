@@ -118,8 +118,12 @@ class PageInfo:
 @dataclass
 class Highlight:
     text: str
+    #: Position of the page in the document as the tablet shows it (0-based).
     page_index: int
     color: str | None = None
+    #: Page of the original PDF/EPUB (0-based); differs from ``page_index`` once
+    #: pages are inserted on the tablet, and is the number to cite.
+    source_page: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -131,13 +135,26 @@ class PageText:
     #: Typed text (keyboard / type folio), as Markdown.
     text: str
     highlights: list[Highlight] = field(default_factory=list)
+    #: Page of the original PDF/EPUB (0-based), ``None`` for notebook and inserted pages.
+    source_page: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "index": self.index,
+            "source_page": self.source_page,
             "text": self.text,
             "highlights": [h.to_dict() for h in self.highlights],
         }
+
+    def heading(self, has_source: bool) -> str:
+        """``Page 3``, ``PDF page 2 (tablet page 3)`` or ``Inserted page (tablet page 3)``."""
+        if not has_source:
+            return f"Page {self.index + 1}"
+        if self.source_page is None:
+            return f"Inserted page (tablet page {self.index + 1})"
+        if self.source_page == self.index:
+            return f"Page {self.index + 1}"
+        return f"PDF page {self.source_page + 1} (tablet page {self.index + 1})"
 
 
 @dataclass
@@ -145,13 +162,16 @@ class DocumentText:
     id: str
     name: str
     pages: list[PageText]
+    #: ``"pdf"``, ``"epub"`` or ``"notebook"``.
+    file_type: str | None = None
 
     def to_markdown(self) -> str:
+        has_source = self.file_type in ("pdf", "epub")
         parts = [f"# {self.name}\n"]
         for page in self.pages:
             if not page.text.strip() and not page.highlights:
                 continue
-            parts.append(f"\n## Page {page.index + 1}\n")
+            parts.append(f"\n## {page.heading(has_source)}\n")
             if page.text.strip():
                 parts.append(page.text.rstrip() + "\n")
             if page.highlights:
@@ -161,4 +181,9 @@ class DocumentText:
         return "".join(parts)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"id": self.id, "name": self.name, "pages": [p.to_dict() for p in self.pages]}
+        return {
+            "id": self.id,
+            "name": self.name,
+            "file_type": self.file_type,
+            "pages": [p.to_dict() for p in self.pages],
+        }

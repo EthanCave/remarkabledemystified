@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import __version__
-from .config import BACKENDS, connect, load_settings
+from .config import BACKENDS, connect, load_settings, read_config_file
 from .errors import InvalidRequest, NotFound, RemarkableError
 from .library import Library
 from .model import Item
@@ -244,6 +244,83 @@ def _common_options(default: object) -> argparse.ArgumentParser:
     return common
 
 
+def _mcp_client_config(args: argparse.Namespace, settings) -> dict[str, Any]:
+    """A claude_desktop_config.json entry for this machine.
+
+    Claude starts ``rmd`` with only this environment, from another working
+    directory, so every path is absolute and every non-default setting that does
+    not come from the config file is spelled out. The SSH password is never printed.
+    """
+    import shutil
+
+    from .config import Settings, config_file_path
+
+    exe = shutil.which("rmd")
+    command, cli_args = (exe, ["mcp"]) if exe else (sys.executable, ["-m", "remarkable_demystified", "mcp"])
+    if args.allow_write:
+        cli_args.append("--allow-write")
+
+    def absolute(path: str) -> str:
+        return str(Path(path).expanduser().resolve())
+
+    defaults = Settings()
+    env: dict[str, str] = {"RMD_BACKEND": settings.backend}
+    config_file = config_file_path(args.config)
+    has_config = config_file.exists()
+    if has_config:
+        env["RMD_CONFIG"] = absolute(str(config_file))
+    if settings.backend == "ssh":
+        for name in ("ssh_host", "ssh_port", "ssh_user", "ssh_restart", "xochitl_dir"):
+            # With a config file, spell values out: a flag may override the file with a default.
+            if has_config or getattr(settings, name) != getattr(defaults, name):
+                env[f"RMD_{name.upper()}"] = str(getattr(settings, name))
+        if settings.ssh_strict_host_key:
+            env["RMD_SSH_STRICT_HOST_KEY"] = "true"
+        env["RMD_KNOWN_HOSTS"] = absolute(settings.known_hosts) if settings.known_hosts else ""
+        if settings.ssh_key:
+            env["RMD_SSH_KEY"] = absolute(settings.ssh_key)
+        elif not (read_config_file(args.config).get("ssh") or {}).get("password"):
+            env["RMD_SSH_PASSWORD"] = "<root password: Settings > Help > Copyrights and licenses>"
+    elif settings.backend == "local" and settings.local_dir:
+        env["RMD_LOCAL_DIR"] = absolute(settings.local_dir)
+    elif settings.backend == "usb" and settings.usb_url != defaults.usb_url:
+        env["RMD_USB_URL"] = settings.usb_url
+    elif settings.backend == "cloud":
+        if settings.cloud_token_file:
+            env["RMD_CLOUD_TOKEN_FILE"] = absolute(settings.cloud_token_file)
+        if settings.cache_dir:
+            env["RMD_CACHE_DIR"] = absolute(settings.cache_dir)
+    return {"mcpServers": {"remarkable": {"command": command, "args": cli_args, "env": env}}}
+
+
+def cmd_mcp(args: argparse.Namespace) -> None:
+    settings = load_settings(
+        args.config, backend=args.backend, ssh_host=args.host, ssh_password=args.password,
+        ssh_key=args.key, local_dir=args.local_dir,
+    )
+    if args.print_config:
+        _print_json(_mcp_client_config(args, settings))
+        return
+    try:
+        from .server.mcp_server import build_server
+    except ImportError as exc:
+        raise InvalidRequest(
+            f"the MCP server needs the optional extra: pip install 'remarkable-demystified[mcp]' ({exc})"
+        ) from exc
+    from .library import ALL_CAPABILITIES
+    from .storage.usbweb import UsbWebLibrary
+
+    caps = UsbWebLibrary.capabilities if settings.backend == "usb" else ALL_CAPABILITIES
+    server = build_server(
+        lambda: connect(settings),
+        allow_write=args.allow_write,
+        capabilities=caps,
+        max_upload_mb=settings.max_upload_mb,
+    )
+    # stdio transport: stdout belongs to the protocol, so nothing else may print to it.
+    server.run()
+
+
 def build_parser() -> argparse.ArgumentParser:
     # Options work before or after the subcommand; SUPPRESS keeps the subcommand's
     # copy from overwriting a value given before it.
@@ -332,6 +409,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("cloud-login", help="connect to your reMarkable cloud account", parents=[common])
     p.add_argument("code", nargs="?", help="8-letter code from my.remarkable.com/device/browser/connect")
     p.set_defaults(func=None, standalone=cmd_cloud_login)
+
+    p = sub.add_parser("mcp", help="run the MCP server for Claude Desktop / Claude Code (stdio)", parents=[common])
+    p.add_argument("--allow-write", action="store_true",
+                   help="also offer tools that create, rename, move, upload and trash (never permanent delete)")
+    p.add_argument("--print-config", action="store_true",
+                   help="print a claude_desktop_config.json entry for this machine and exit")
+    p.set_defaults(func=None, standalone=cmd_mcp)
 
     p = sub.add_parser("serve", help="run the REST API", parents=[common])
     p.add_argument("--bind", default="127.0.0.1", help="interface to listen on (default 127.0.0.1)")

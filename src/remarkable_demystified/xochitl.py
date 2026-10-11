@@ -39,6 +39,9 @@ TEMPLATE = "TemplateType"
 #: Extensions that xochitl accepts as the "original" file of a document.
 SOURCE_EXTENSIONS = ("pdf", "epub")
 
+#: Upper bound on pages synthesized from a ``pageCount`` (protects against crafted files).
+MAX_PAGES = 10_000
+
 #: Display geometry of the tablets, in pixels. Strokes are stored in these units.
 RM2_WIDTH = 1404
 RM2_HEIGHT = 1872
@@ -260,7 +263,13 @@ def page_refs(content: dict[str, Any], source_page_count: int | None = None) -> 
         return refs
 
     # PDF/EPUB that the tablet has not paginated yet.
-    count = source_page_count if source_page_count is not None else content.get("pageCount") or 0
+    if source_page_count is not None:
+        count = max(0, source_page_count)  # counted from the PDF itself: trusted
+    else:
+        try:
+            count = max(0, min(int(content.get("pageCount") or 0), MAX_PAGES))
+        except (TypeError, ValueError, OverflowError):
+            count = 0
     if has_source and count:
         return [PageRef(index=i, id=f"page-{i}", source_page=i) for i in range(count)]
     return []

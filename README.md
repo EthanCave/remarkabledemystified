@@ -1,10 +1,10 @@
 # remarkabledemystified
 
-A Python library, REST API and command-line tool for **reading, editing and
-organizing everything on a reMarkable tablet**: list and search your library,
-upload PDFs/EPUBs, create notebooks with typed text, rename/move/pin/tag/trash
-documents, and export your handwriting and highlights as PDF, PNG, SVG or
-Markdown.
+A Python library, REST API, command-line tool and **MCP server for Claude** for
+**reading, editing and organizing everything on a reMarkable tablet**: list and
+search your library, upload PDFs/EPUBs, create notebooks with typed text,
+rename/move/pin/tag/trash documents, export your handwriting and highlights as
+PDF, PNG, SVG or Markdown, and let Claude read your handwritten notes.
 
 It talks to the tablet in whichever way suits you:
 
@@ -27,21 +27,23 @@ It talks to the tablet in whichever way suits you:
 ```bash
 git clone https://github.com/ethancave/remarkabledemystified
 cd remarkabledemystified
-pip install -e .            # or: uv pip install -e .
+pip install -e ".[mcp]"     # or: uv pip install -e ".[mcp]"; drop [mcp] if you don't want the Claude server
 rmd --help
 ```
 
-Python 3.10+. Optional: install `pymupdf` *or* poppler's `pdftoppm` to draw the
-underlying PDF page behind PNG/SVG page renders (PDF exports never need them).
+Python 3.10+. The `[mcp]` extra adds the MCP server and `pypdfium2`, which draws the
+underlying PDF page behind PNG/SVG page renders (`[render]` installs just that; PyMuPDF
+or poppler's `pdftoppm` also work). PDF exports never need a renderer.
 
 ## Connect your tablet
 
 ### SSH (recommended, full access)
 
 1. Plug the tablet in with USB (it appears at `10.11.99.1`), or use its Wi-Fi IP.
-2. Find the root password: **Settings → Help → Copyrights and licenses**, at the
-   bottom of the *GPLv3 Compliance* section (reMarkable 1 and 2).
-   *reMarkable Paper Pro / Move:* you must first enable **developer mode**, which
+2. Find the root password (and the Wi-Fi IP) under **Settings → Help → Copyrights and
+   licenses**, in the *GPLv3 Compliance* section. On OS 3.9–3.18 it is under
+   **Settings → About → Copyrights and licenses**.
+   *reMarkable Paper Pro / Move / Pure:* you must first enable **developer mode**, which
    **factory-resets the tablet**. Sync to the cloud before you do that.
 3. Tell `rmd` about it:
 
@@ -52,6 +54,25 @@ underlying PDF page behind PNG/SVG page renders (PDF exports never need them).
 
    SSH keys work too (`RMD_SSH_KEY=~/.ssh/id_ed25519`, after copying your public
    key into `/home/root/.ssh/authorized_keys` on the tablet).
+
+**Over Wi-Fi.** SSH over Wi-Fi is switched off on the reMarkable 2 from OS 3.20 onward and on
+every Paper Pro, Move and Pure. Turn it on once over the cable; it survives OS updates:
+
+```bash
+ssh root@10.11.99.1 rm-ssh-over-wlan on
+export RMD_SSH_HOST=192.168.1.42      # the Wi-Fi address from the Copyrights screen
+```
+
+([official docs](https://developer.remarkable.com/documentation/developer-mode),
+[community guide](https://remarkable.guide/guide/access/ssh.html))
+
+On shared networks (campus Wi-Fi), mind the host key: `rmd` remembers the tablet's key for
+each address the first time it connects (logging its fingerprint) and refuses a different
+key later. Keys are stored per address, so pin the Wi-Fi address itself, ideally from a
+network you trust, or add it while on the cable:
+`ssh-keyscan 192.168.1.42 >> ~/.config/remarkable-demystified/known_hosts`. Then set
+`RMD_SSH_STRICT_HOST_KEY=true` to refuse unknown keys outright, and prefer an SSH key
+(`RMD_SSH_KEY`) over the password.
 
 When something changes over SSH, `rmd` briefly stops the tablet UI (`xochitl`),
 writes the files, and starts it again so the tablet sees the change. That is the
@@ -91,6 +112,7 @@ host = "10.11.99.1"        # or the tablet's Wi-Fi address
 password = "the-password"
 # key = "~/.ssh/id_ed25519"
 # restart = "never"
+# strict_host_key = true   # refuse tablets whose host key isn't already known
 
 [server]
 api_token = "a-long-random-string"   # required by the REST API when set
@@ -100,6 +122,55 @@ Every key has an environment variable (`RMD_BACKEND`, `RMD_SSH_HOST`,
 `RMD_SSH_PASSWORD`, `RMD_SSH_KEY`, `RMD_SSH_PORT`, `RMD_SSH_RESTART`,
 `RMD_LOCAL_DIR`, `RMD_USB_URL`, `RMD_API_TOKEN`, ...). Precedence: command-line
 flag > environment > config file > default.
+
+---
+
+## Use it from Claude (MCP)
+
+`rmd mcp` is an [MCP](https://modelcontextprotocol.io) server, so Claude Desktop, Claude Code
+or any MCP client can browse your tablet and read your notes, **including handwriting**: it
+hands Claude images of the pages and Claude reads the ink itself (no OCR engine or API key).
+
+**Claude Desktop.** Print a ready-made entry (absolute paths, every setting it needs):
+
+```bash
+rmd mcp --print-config               # add --allow-write to let Claude make changes
+```
+
+Open `claude_desktop_config.json` (Settings → Developer → Edit Config) and add the
+`"remarkable"` entry inside the existing `"mcpServers"` object (create that object if the
+file has none), fill in the password, and restart Claude.
+
+**Claude Code.** Register it for all your projects, using the absolute path to `rmd` so it
+works even when the virtualenv isn't active:
+
+```bash
+claude mcp add --scope user remarkable \
+  -e RMD_SSH_PASSWORD='the-password' \
+  -- "$(command -v rmd)" mcp           # add -e RMD_SSH_HOST=192.168.1.42 for Wi-Fi
+```
+
+Then ask things like *"What did I write in Tuesday's Algorithms lecture?"*, *"Summarize my
+highlights in the Smith 2024 paper, citing pages"*, or, with writes enabled, *"Turn the action
+items on my last meeting page into a checklist notebook on my tablet."*
+
+| Tool | What it does |
+|---|---|
+| `browse`, `find`, `recent`, `current` | folders, name/tag search, recently opened, the page open right now (not over the USB web interface) |
+| `list_pages` | which pages have handwriting, and which PDF page each shows (in ranges of up to 500) |
+| `read_document` | typed text and highlights as Markdown; optionally the PDF's printed text |
+| `view_pages` | page images (handwriting, highlights, the PDF underneath, ink past the page edge) for Claude to read; up to 4 pages per call |
+| `device_info` | battery, storage, firmware |
+| *with `--allow-write`:* `create_notebook`, `create_folder`, `organize`, `move_many`, `trash`, `restore`, `upload_file` | create, rename, move, favorite, tag, trash (reversible), upload |
+
+**Safety.** The server is read-only unless started with `--allow-write`, and even then it
+never offers permanent delete, emptying the trash, replacing files or raw file access.
+Claude is told to treat text inside your documents as content, not instructions. With
+`--allow-write`, `upload_file` can send any PDF, EPUB or `.rmdoc` your account can read to
+the tablet (and Claude can then read it), so only enable writes in conversations you trust.
+Over SSH each write briefly restarts the tablet's interface (closing the open document), so
+ask Claude to batch moves. Edits are applied to the tablet's files as they are at that moment,
+so a page you just added is never lost to an edit made from an older listing.
 
 ---
 
@@ -142,7 +213,7 @@ Use `GET /items/resolve?path=/Books/Dune` to turn a path into an id.
 | `GET /documents/{id}/archive` | `.rmdoc` archive (re-importable) |
 | `GET /documents/{id}/pages` | pages with PDF page mapping and annotation flags |
 | `GET /documents/{id}/pages/{n}` | render page `n` (0-based): `?format=svg\|png\|pdf&scale=1` |
-| `GET /documents/{id}/text` | typed text + highlighted passages; `?format=markdown` |
+| `GET /documents/{id}/text` | typed text + highlighted passages; `?format=markdown`. Each page carries `index` (position on the tablet) and `source_page` (page of the original PDF, the one to cite) |
 | `GET /documents/{id}/files[/{name}]` | the raw xochitl files |
 
 ```bash
@@ -256,22 +327,28 @@ means the tablet synced first: re-read and retry). Full description in
   grain, brush) are simplified, and typed-text wrapping uses estimated glyph widths.
 * Editing existing handwriting isn't supported. You can create notebooks with
   typed text, and add, replace and reorganize documents.
-* PNG/SVG renders show the PDF page underneath only if PyMuPDF or poppler is installed.
+* PNG/SVG renders show the PDF page underneath only with a renderer installed
+  (`pypdfium2` via the `[mcp]`/`[render]` extra, PyMuPDF, or poppler).
+* Where the tablet stores *PDF text-highlight* boxes is not confirmed: the highlighted text
+  and its page are exact, but the boxes may be drawn slightly off in exports.
+* "The page open right now" (`current`) can lag: the tablet saves the open page and fresh
+  ink to disk when you turn the page or close the document.
 * The cloud and USB web interfaces are undocumented by reMarkable and may change.
 
 ## Development
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-pytest              # 68 tests; SSH tests start a throwaway sshd if OpenSSH server is installed
+pytest              # SSH tests start a throwaway sshd if OpenSSH server is installed
 ruff check src tests && mypy src
 ```
 
 The tests run against a realistic fake library: real `.rm` pages written by
 tablets (from rmscene's test suite, MIT, see `tests/data/rm/LICENSE-rmscene`),
 a strict fake cloud server (`tests/fake_cloud.py`) that enforces hashes, sort
-order, CRC32C headers and generations, a fake USB web interface, and a real
-OpenSSH server with a fake `systemctl`.
+order, CRC32C headers and generations, a fake USB web interface, a real
+OpenSSH server with a fake `systemctl`, and the MCP server driven by the official MCP
+client both in-process and over stdio (exactly how Claude Desktop launches it).
 
 Built on the shoulders of [rmscene](https://github.com/ricklupton/rmscene),
 [rmc](https://github.com/ricklupton/rmc) and [rmapi](https://github.com/ddvk/rmapi).

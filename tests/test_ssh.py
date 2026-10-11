@@ -155,3 +155,36 @@ def test_wrong_key_is_auth_error(sshd, tmp_path):
                          key_filename=sshd["stranger"], xochitl_dir=str(tmp_path))
     with pytest.raises(AuthError):
         storage.run("true")
+
+
+def test_tag_edit_keeps_pages_the_tablet_added_meanwhile(remote):
+    # Regression (review S2): the edit used to be computed from a listing cached up to
+    # 5 s earlier and overwrite pages the tablet saved in the meantime.
+    lib, root, _ = remote
+    lib.items()  # listing cached
+    content_path = root / f"{NOTEBOOK_ID}.content"
+    content = json.loads(content_path.read_text())
+    content["cPages"]["pages"].append({"id": "n-3", "idx": {"timestamp": "1:9", "value": "bz"}})
+    content_path.write_text(json.dumps(content))
+    lib.update(NOTEBOOK_ID, tags=["meeting"], name="Notes (tagged)")
+    after = json.loads(content_path.read_text())
+    assert any(p["id"] == "n-3" for p in after["cPages"]["pages"])
+    assert [t["name"] for t in after["tags"]] == ["meeting"]
+    assert json.loads((root / f"{NOTEBOOK_ID}.metadata").read_text())["visibleName"] == "Notes (tagged)"
+
+
+def test_host_key_trust(sshd, tmp_path, caplog):
+    from remarkable_demystified.errors import ConnectionFailed
+
+    strict = SSHStorage("127.0.0.1", port=sshd["port"], username=getpass.getuser(), key_filename=sshd["key"],
+                        xochitl_dir=str(tmp_path), known_hosts=tmp_path / "kh", strict_host_key=True)
+    with pytest.raises(ConnectionFailed, match="ssh-keyscan -p"):
+        strict.run("true")
+    tofu = SSHStorage("127.0.0.1", port=sshd["port"], username=getpass.getuser(), key_filename=sshd["key"],
+                      xochitl_dir=str(tmp_path), known_hosts=tmp_path / "kh")
+    with caplog.at_level("WARNING"):
+        tofu.run("true")
+    assert "trusting new SSH host key" in caplog.text and "SHA256:" in caplog.text
+    tofu.close()
+    strict.run("true")  # now pinned in known_hosts, so strict mode accepts it
+    strict.close()

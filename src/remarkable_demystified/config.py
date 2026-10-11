@@ -57,6 +57,8 @@ class Settings:
     ssh_password: str | None = None
     ssh_key: str | None = None
     ssh_restart: str = "auto"
+    #: Refuse tablets whose host key is not already in known_hosts (no trust-on-first-use).
+    ssh_strict_host_key: bool = False
     xochitl_dir: str = "/home/root/.local/share/remarkable/xochitl"
     known_hosts: str = field(default_factory=lambda: str(config_dir() / "known_hosts"))
 
@@ -91,6 +93,7 @@ _FILE_KEYS = {
     ("ssh", "restart"): "ssh_restart",
     ("ssh", "xochitl_dir"): "xochitl_dir",
     ("ssh", "known_hosts"): "known_hosts",
+    ("ssh", "strict_host_key"): "ssh_strict_host_key",
     ("local", "dir"): "local_dir",
     ("cloud", "token_file"): "cloud_token_file",
     ("cloud", "auth_host"): "cloud_auth_host",
@@ -103,6 +106,15 @@ _FILE_KEYS = {
 
 
 def _coerce(name: str, value: Any) -> Any:
+    if name == "ssh_strict_host_key":
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off", ""):
+            return False
+        raise InvalidRequest(f"{name} must be true or false, got {value!r}")
     if name in ("ssh_port", "max_upload_mb"):
         try:
             return int(value)
@@ -111,14 +123,26 @@ def _coerce(name: str, value: Any) -> Any:
     return None if value == "" else str(value)
 
 
+def config_file_path(config_file: str | os.PathLike[str] | None = None) -> Path:
+    return Path(config_file or os.environ.get("RMD_CONFIG") or config_dir() / "config.toml").expanduser()
+
+
+def read_config_file(config_file: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+    """The raw TOML of the config file, or ``{}`` if there is none."""
+    path = config_file_path(config_file)
+    if not path.exists():
+        return {}
+    try:
+        return tomllib.loads(path.read_text())
+    except tomllib.TOMLDecodeError as exc:
+        raise InvalidRequest(f"{path} is not valid TOML: {exc}") from exc
+
+
 def load_settings(config_file: str | os.PathLike[str] | None = None, **overrides: Any) -> Settings:
     settings = Settings()
-    path = Path(config_file or os.environ.get("RMD_CONFIG") or config_dir() / "config.toml").expanduser()
+    path = config_file_path(config_file)
     if path.exists():
-        try:
-            data = tomllib.loads(path.read_text())
-        except tomllib.TOMLDecodeError as exc:
-            raise InvalidRequest(f"{path} is not valid TOML: {exc}") from exc
+        data = read_config_file(config_file)
         for (section, key), name in _FILE_KEYS.items():
             scope = data if not section else data.get(section, {})
             if isinstance(scope, dict) and key in scope:
@@ -164,6 +188,7 @@ def connect(settings: Settings | None = None, **overrides: Any):
             xochitl_dir=settings.xochitl_dir,
             restart=settings.ssh_restart,
             known_hosts=settings.known_hosts,
+            strict_host_key=settings.ssh_strict_host_key,
         ))
     if settings.backend == "cloud":
         from .storage.cloud import CloudAuth, CloudStorage

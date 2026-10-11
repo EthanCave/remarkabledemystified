@@ -14,6 +14,7 @@ import json
 import logging
 import zipfile
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -28,10 +29,16 @@ log = logging.getLogger(__name__)
 
 #: Everything a :class:`Library` can do. Limited backends (USB web) advertise less.
 ALL_CAPABILITIES = frozenset({
-    "list", "read_files", "download", "export_pdf", "export_archive", "render", "text",
+    "list", "history", "read_files", "download", "export_pdf", "export_archive", "render", "text",
     "upload", "import_archive", "create_folder", "create_notebook", "rename", "move",
     "pin", "tags", "trash", "delete", "replace_source",
 })
+
+#: Deepest folder path ensure_folder will create (each level is one folder).
+MAX_FOLDER_DEPTH = 10
+#: Limits on unpacking imported .rmdoc/.zip archives (zip bombs).
+MAX_ARCHIVE_ENTRIES = 20_000
+DEFAULT_MAX_UNPACKED = 1024 * 1024 * 1024
 
 #: Files that only make sense on the device that wrote them.
 _ARCHIVE_EXCLUDE = (".local", ".cache/", ".tombstone")
@@ -154,8 +161,14 @@ class Library:
             parts.append("Trash")
         return "/" + "/".join(reversed(parts))
 
-    def resolve(self, ref: str) -> Item:
-        """Find an item by id or by path (``/Books/Dune``; ``/Trash/...`` for the trash)."""
+    def resolve(self, ref: str, kind: str | None = None) -> Item:
+        """Find an item by id or by path (``/Books/Dune``; ``/Trash/...`` for the trash).
+
+        Names may themselves contain "/" ("Meeting 10/10"). ``kind`` ("document" or
+        "folder") decides between a folder and a document with the same name. If
+        several items still match, :class:`InvalidRequest` lists their ids rather
+        than silently picking one.
+        """
         ref = ref.strip()
         if ref in ("", "/"):
             return ROOT_ITEM
@@ -164,26 +177,71 @@ class Library:
             return self.get(ref)
         if ref.lower() in ("trash", "/trash"):
             return TRASH_ITEM
-        parts = [p for p in PurePosixPath(ref).parts if p != "/"]
+        parts = [p for p in ref.split("/") if p and p != "."]
         items = self.items(include_trash=True)
-        parent = xochitl.ROOT
+        children: dict[str, list[Item]] = {}
+        for item in items:
+            children.setdefault(item.parent, []).append(item)
+        start: Item = ROOT_ITEM
         if parts and parts[0].lower() == "trash" and not any(
-            i.parent == xochitl.ROOT and i.name == parts[0] for i in items
+            i.name.casefold() == "trash" for i in children.get(xochitl.ROOT, [])
         ):
-            parent = xochitl.TRASH
-            parts = parts[1:]
-        current: Item = ROOT_ITEM if parent == xochitl.ROOT else TRASH_ITEM
-        for part in parts:
-            siblings = [i for i in items if i.parent == current.id]
-            matches = [i for i in siblings if i.name == part] or [
-                i for i in siblings if i.name.casefold() == part.casefold()
+            start, parts = TRASH_ITEM, parts[1:]
+
+        def named(parent: str, name: str) -> list[Item]:
+            siblings = children.get(parent, [])
+            return [i for i in siblings if i.name == name] or [
+                i for i in siblings if i.name.casefold() == name.casefold()
             ]
-            if not matches:
-                raise NotFound(f"nothing called {part!r} in {self.path(current.id)}")
-            # Prefer folders when walking, and the most recently modified on ties.
-            matches.sort(key=lambda i: (not i.is_folder, -(i.last_modified.timestamp() if i.last_modified else 0)))
-            current = matches[0]
-        return current
+
+        def newest_first(found: list[Item]) -> list[Item]:
+            return sorted(found, key=lambda i: -(i.last_modified.timestamp() if i.last_modified else 0))
+
+        def pick(parent: Item, name: str, found: list[Item]) -> Item:
+            if kind is not None:
+                found = [i for i in found if i.type == kind] or found
+            if len(found) > 1:
+                listing = "; ".join(
+                    f"{i.type} {i.id}" + (f" (modified {i.last_modified:%Y-%m-%d %H:%M})" if i.last_modified else "")
+                    for i in newest_first(found)
+                )
+                raise InvalidRequest(
+                    f"{len(found)} items are called {name!r} in {self.path(parent.id)}: {listing}. Use an id instead."
+                )
+            return found[0]
+
+        def walk(parent: Item, rest: list[str]) -> Item:
+            deepest: NotFound | None = None  # report where the path really stopped matching
+            # Longest name first, so "A/B testing 1/2" can be one notebook's name.
+            for k in range(len(rest), 0, -1):
+                name = "/".join(rest[:k])
+                found = named(parent.id, name)
+                if not found:
+                    continue
+                if k == len(rest):
+                    return pick(parent, name, found)
+                folders = [i for i in found if i.is_folder]
+                if not folders:
+                    deepest = deepest or NotFound(f"{self.path(found[0].id)} is a document, not a folder")
+                    continue
+                results: dict[str, Item] = {}
+                for folder in newest_first(folders):
+                    try:
+                        hit = walk(folder, rest[k:])
+                        results[hit.id] = hit
+                    except NotFound as exc:
+                        deepest = deepest or exc
+                if len(results) == 1:
+                    return next(iter(results.values()))
+                if len(results) > 1:
+                    listing = "; ".join(f"{i.type} {i.id} ({self.path(i.id)})" for i in results.values())
+                    raise InvalidRequest(
+                        f"{len(results)} items match {ref!r} (folders called {name!r} share a name): "
+                        f"{listing}. Use an id instead."
+                    )
+            raise deepest or NotFound(f"nothing called {rest[0]!r} in {self.path(parent.id)}")
+
+        return walk(start, parts) if parts else start
 
     def search(self, query: str, *, include_trash: bool = False, type: str | None = None) -> list[Item]:
         """Items whose name or tags contain ``query`` (case-insensitive)."""
@@ -241,21 +299,62 @@ class Library:
         return self.get(doc_id)
 
     def ensure_folder(self, path: str) -> Item:
-        """Return the folder at ``path``, creating missing folders along the way."""
-        current = ROOT_ITEM
-        for part in [p for p in PurePosixPath(path).parts if p != "/"]:
-            existing = [i for i in self.children(current.id) if i.is_folder and i.name == part]
-            current = existing[0] if existing else self.create_folder(part, current.id)
-        return current
+        """The folder at ``path`` (a path or a folder id), creating missing folders in one write."""
+        path = path.strip()
+        try:
+            existing = self.resolve(path, kind="folder")
+        except NotFound:
+            existing = None
+        if existing is not None:
+            if not existing.is_folder:
+                raise InvalidRequest(f"{self.path(existing.id)} is a document, not a folder")
+            if existing.id == xochitl.TRASH or self.path(existing.id).startswith("/Trash/"):
+                raise InvalidRequest("cannot put new items in the trash")
+            return existing
+        parts = [p.strip() for p in path.split("/") if p.strip()]
+        if parts and parts[0].casefold() == "trash":
+            raise InvalidRequest("cannot create folders in the trash")
+        if any(p in (".", "..") for p in parts):
+            raise InvalidRequest("folder names cannot be '.' or '..'")
+        if len(parts) > MAX_FOLDER_DEPTH:
+            raise InvalidRequest(f"folder paths are limited to {MAX_FOLDER_DEPTH} levels")
+        current: Item = ROOT_ITEM
+        for k in range(len(parts) - 1, 0, -1):  # deepest existing prefix, matched like resolve()
+            try:
+                prefix = self.resolve("/" + "/".join(parts[:k]), kind="folder")
+            except NotFound:
+                continue
+            if not prefix.is_folder:
+                raise InvalidRequest(f"{self.path(prefix.id)} is a document, not a folder")
+            current, parts = prefix, parts[k:]
+            break
+        changes, parent = [], current.id
+        for part in parts:
+            folder_id = xochitl.new_id()
+            changes.append(DocChange(folder_id, write={
+                xochitl.content_name(folder_id): xochitl.dumps(xochitl.folder_content()),
+                xochitl.metadata_name(folder_id): xochitl.dumps(
+                    xochitl.new_metadata(self._check_name(part), parent, xochitl.COLLECTION)
+                ),
+            }))
+            parent = folder_id
+        self.storage.apply(changes)
+        return self.get(parent)
 
-    def upload(self, data: bytes, filename: str, *, parent: str = xochitl.ROOT, name: str | None = None) -> Item:
+    def upload(
+        self,
+        data: bytes,
+        filename: str,
+        *,
+        parent: str = xochitl.ROOT,
+        name: str | None = None,
+        max_unpacked: int = DEFAULT_MAX_UNPACKED,
+    ) -> Item:
         """Add a PDF, EPUB, or ``.rmdoc``/``.zip`` archive to the library."""
         ext = PurePosixPath(filename).suffix.lower().lstrip(".")
         if ext in ("rmdoc", "zip"):
-            return self.import_archive(data, parent=parent, name=name)
-        if ext not in xochitl.SOURCE_EXTENSIONS:
-            raise InvalidRequest(f"unsupported file type .{ext}: upload a PDF, EPUB or .rmdoc")
-        _check_magic(data, ext)
+            return self.import_archive(data, parent=parent, name=name, max_unpacked=max_unpacked)
+        validate_upload(data, filename)
         name = self._check_name(name or PurePosixPath(filename).stem)
         self._check_parent(parent)
         doc_id = xochitl.new_id()
@@ -309,12 +408,15 @@ class Library:
             changes["parent"] = parent
         if pinned is not None:
             changes["pinned"] = bool(pinned)
-        files: dict[str, bytes] = {}
+        # Patches, not precomputed bytes: they run against the files as they are when the
+        # write happens (over SSH: after the tablet UI stopped and saved its state).
+        patch: dict[str, Any] = {}
         if tags is not None:
-            files[xochitl.content_name(item_id)] = xochitl.dumps(xochitl.with_tags(rec.content, tags))
-        if changes or files:
-            files[xochitl.metadata_name(item_id)] = xochitl.dumps(xochitl.updated_metadata(rec.metadata, **changes))
-            self.storage.apply([DocChange(item_id, write=files)])
+            tag_list = list(tags)
+            patch[xochitl.content_name(item_id)] = lambda content: xochitl.with_tags(content, tag_list)
+        if changes or patch:
+            patch[xochitl.metadata_name(item_id)] = lambda meta: xochitl.updated_metadata(meta, **changes)
+            self.storage.apply([DocChange(item_id, patch=patch)])
         return self.get(item_id)
 
     def _is_descendant(self, candidate: str, ancestor: str) -> bool:
@@ -385,20 +487,37 @@ class Library:
         if item.file_type != ext:
             raise InvalidRequest(f"document is a {item.file_type}; upload a .{item.file_type} to replace it")
         _check_magic(data, ext)
-        rec = self._records()[item_id]
-        files = {xochitl.source_name(item_id, ext): data}
-        files[xochitl.metadata_name(item_id)] = xochitl.dumps(xochitl.updated_metadata(rec.metadata))
-        self.storage.apply([DocChange(item_id, write=files)])
+        self.storage.apply([DocChange(
+            item_id,
+            write={xochitl.source_name(item_id, ext): data},
+            patch={xochitl.metadata_name(item_id): lambda meta: xochitl.updated_metadata(meta)},
+        )])
         return self.get(item_id)
 
-    def import_archive(self, data: bytes, *, parent: str = xochitl.ROOT, name: str | None = None) -> Item:
-        """Import a ``.rmdoc`` (the desktop app's export format) or an rmapi ``.zip``."""
+    def import_archive(
+        self,
+        data: bytes,
+        *,
+        parent: str = xochitl.ROOT,
+        name: str | None = None,
+        max_unpacked: int = DEFAULT_MAX_UNPACKED,
+    ) -> Item:
+        """Import a ``.rmdoc`` (the desktop app's export format) or an rmapi ``.zip``.
+
+        ``max_unpacked`` caps the total uncompressed size, so a small archive cannot
+        fill the tablet (or this machine's memory).
+        """
         self._check_parent(parent)
         try:
             zf = zipfile.ZipFile(io.BytesIO(data))
         except zipfile.BadZipFile as exc:
             raise InvalidRequest("not a valid .rmdoc/.zip archive") from exc
-        names = [n for n in zf.namelist() if not n.endswith("/")]
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        if len(infos) > MAX_ARCHIVE_ENTRIES:
+            raise InvalidRequest(f"archive has more than {MAX_ARCHIVE_ENTRIES} files")
+        if sum(i.file_size for i in infos) > max_unpacked:
+            raise InvalidRequest(f"archive unpacks to more than {max_unpacked // (1024 * 1024)} MB")
+        names = [i.filename for i in infos]
         ids = {xochitl.doc_id_of(n) for n in names if n.endswith(".content")}
         if len(ids) != 1:
             raise InvalidRequest("archive must contain exactly one <id>.content file")
@@ -408,7 +527,11 @@ class Library:
         for n in names:
             if not xochitl.is_safe_file_name(old_id, n):
                 continue
-            files[new_id + n[len(old_id):]] = zf.read(n)
+            with zf.open(n) as entry:
+                content_bytes = entry.read(max_unpacked + 1)
+            if len(content_bytes) > max_unpacked:
+                raise InvalidRequest(f"archive unpacks to more than {max_unpacked // (1024 * 1024)} MB")
+            files[new_id + n[len(old_id):]] = content_bytes
         meta_name = xochitl.metadata_name(new_id)
         content = xochitl.loads(files.get(xochitl.content_name(new_id)))
         metadata = xochitl.loads(files.get(meta_name)) or xochitl.new_metadata(
@@ -535,47 +658,99 @@ class Library:
         *,
         scale: float = 1.0,
         background: bool = True,
+        crop: str | None = None,
     ) -> tuple[bytes, str]:
-        """Render one page as ``svg``, ``png`` or ``pdf``. Returns ``(bytes, media type)``."""
+        """Render one page as ``svg``, ``png`` or ``pdf``. Returns ``(bytes, media type)``.
+
+        ``crop``: ``"page"`` (the screen area; default for PDF pages) or ``"content"``
+        (grown to include ink past the edges; default for notebooks).
+        """
+        rendered = self.render_pages(item_id, [page], fmt, scale=scale, background=background, crop=crop)[0]
+        return rendered.data, rendered.media_type
+
+    def render_pages(
+        self,
+        item_id: str,
+        pages: Iterable[int],
+        fmt: str = "png",
+        *,
+        scale: float = 1.0,
+        background: bool = True,
+        crop: str | None = None,
+        max_screens: float | None = None,
+    ) -> list[RenderedPage]:
+        """Render several pages, reading the page list, the PDF and the ``.rm`` files once.
+
+        ``max_screens`` limits how far a page may extend, in page heights down and
+        page widths to each side, so a page scrolled (or scribbled) absurdly far
+        cannot exhaust memory. :attr:`RenderedPage.truncated` tells when that happened.
+        """
         if fmt not in ("svg", "png", "pdf"):
             raise InvalidRequest("format must be svg, png or pdf")
         if not 0.05 <= scale <= 4:
             raise InvalidRequest("scale must be between 0.05 and 4")
+        if crop not in (None, "page", "content"):
+            raise InvalidRequest("crop must be page or content")
         item = self._document(item_id)
         files = set(self.storage.list_files(item_id))
         refs = self._page_refs(item, files)
-        if not 0 <= page < len(refs):
-            raise NotFound(f"page {page} does not exist (document has {len(refs)} pages)")
-        ref = refs[page]
-        page_scene = self._scenes(item, [ref], files)[0] or scene.PageScene(version=6)
+        wanted = list(pages)
+        for page in wanted:
+            if not 0 <= page < len(refs):
+                raise NotFound(f"page {page} does not exist (document has {len(refs)} pages)")
+        selected = [refs[p] for p in wanted]
+        scenes = self._scenes(item, selected, files)
         source_pdf = None
-        if ref.source_page is not None and (fmt == "pdf" or background):
+        if any(r.source_page is not None for r in selected) and (fmt == "pdf" or background):
             source_pdf = self._render_pdf_source(item, sorted(files))
 
-        if fmt == "pdf":
-            if source_pdf is not None:
-                return rmpdf.annotate_pdf(source_pdf, [(ref.source_page, page_scene)]), "application/pdf"
-            return rmpdf.notebook_pdf([page_scene]), "application/pdf"
+        out = []
+        for ref, parsed in zip(selected, scenes, strict=True):
+            page_scene = parsed or scene.PageScene(version=6)
+            has_pdf = source_pdf is not None and ref.source_page is not None
+            if fmt == "pdf":
+                if has_pdf:
+                    data = rmpdf.annotate_pdf(source_pdf, [(ref.source_page, page_scene)])  # type: ignore[arg-type]
+                else:
+                    data = rmpdf.notebook_pdf([page_scene])
+                out.append(RenderedPage(ref.index, data, "application/pdf", page_scene.height, False))
+                continue
 
-        bg_image = None
-        box = None
-        if source_pdf is not None and background:
-            width_px = round(page_scene.width * min(scale, 1.0) * 2)
-            try:
-                bg_image = rmpdf.rasterize_page(source_pdf, ref.source_page, width_px)  # type: ignore[arg-type]
-            except Exception as exc:  # noqa: BLE001
-                log.warning("could not rasterize page: %s", exc)
-            if bg_image is not None:
-                box = _pdf_box_on_screen(source_pdf, ref.source_page, page_scene)  # type: ignore[arg-type]
-        crop = "page" if source_pdf is not None else "content"
-        if fmt == "svg":
-            bg_bytes = None
-            if bg_image is not None:
-                buf = io.BytesIO()
-                bg_image.save(buf, "PNG")
-                bg_bytes = buf.getvalue()
-            return render.to_svg(page_scene, background=bg_bytes, background_box=box, crop=crop).encode(), "image/svg+xml"
-        return render.to_png(page_scene, scale=scale, background=bg_image, background_box=box, crop=crop), "image/png"
+            mode = crop or ("page" if has_pdf else "content")
+            x0, y0, x1, y1 = render.page_box(page_scene, mode)
+            truncated = False
+            if max_screens is not None:
+                w, h = float(page_scene.width), float(page_scene.height)
+                limited = (max(x0, -w * max_screens), max(y0, -h), min(x1, w * (1 + max_screens)),
+                           min(y1, max(y0, -h) + h * max_screens))
+                truncated = limited != (x0, y0, x1, y1)
+                x0, y0, x1, y1 = limited
+            box = (x0, y0, x1, y1)
+            bg_image = bg_box = None
+            if has_pdf and background:
+                k = 2 * min(scale, 1.0)
+                try:  # a page pointing past the end of its PDF still renders its ink
+                    bg_box = _pdf_box_on_screen(source_pdf, ref.source_page, page_scene)  # type: ignore[arg-type]
+                    bg_image = rmpdf.rasterize_page(
+                        source_pdf, ref.source_page,  # type: ignore[arg-type]
+                        (max(1, round(bg_box[2] * k)), max(1, round(bg_box[3] * k))),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("could not rasterize page: %s", exc)
+                if bg_image is None:
+                    bg_box = None
+            if fmt == "svg":
+                bg_bytes = None
+                if bg_image is not None:
+                    buf = io.BytesIO()
+                    bg_image.save(buf, "PNG")
+                    bg_bytes = buf.getvalue()
+                data = render.to_svg(page_scene, background=bg_bytes, background_box=bg_box, crop=box).encode()
+                out.append(RenderedPage(ref.index, data, "image/svg+xml", page_scene.height, truncated))
+            else:
+                data = render.to_png(page_scene, scale=scale, background=bg_image, background_box=bg_box, crop=box)
+                out.append(RenderedPage(ref.index, data, "image/png", page_scene.height, truncated))
+        return out
 
     def export_pdf(self, item_id: str) -> bytes:
         """The whole document as a PDF with every annotation drawn in (like the tablet's export)."""
@@ -589,6 +764,25 @@ class Library:
         if not refs:
             scenes = [None]
         return rmpdf.notebook_pdf(scenes)
+
+    def pdf_text(self, item_id: str, pages: Iterable[int] | None = None) -> dict[int, str]:
+        """Printed text of the PDF page behind each tablet page: ``{tablet page index: text}``.
+
+        Uses the PDF's own text layer (scanned PDFs have none). EPUBs work once the
+        tablet has converted them to PDF. Inserted pages and notebooks have no entry.
+        """
+        item = self._document(item_id)
+        files = set(self.storage.list_files(item_id))
+        source_pdf = self._render_pdf_source(item, sorted(files))
+        if source_pdf is None:
+            return {}
+        wanted = set(pages) if pages is not None else None
+        refs = [
+            r for r in self._page_refs(item, files)
+            if r.source_page is not None and (wanted is None or r.index in wanted)
+        ]
+        texts = rmpdf.page_texts(source_pdf, sorted({r.source_page for r in refs if r.source_page is not None}))
+        return {r.index: texts[r.source_page] for r in refs if r.source_page in texts}
 
     def text(self, item_id: str) -> DocumentText:
         """Typed text and highlighted passages, page by page."""
@@ -606,14 +800,15 @@ class Library:
                     text = sc.text.to_markdown()
                 for hl in sc.highlights:
                     if hl.text.strip():
-                        highlights.append(Highlight(hl.text, ref.index, "#{:02x}{:02x}{:02x}".format(*hl.color[:3])))
+                        color = "#{:02x}{:02x}{:02x}".format(*hl.color[:3])
+                        highlights.append(Highlight(hl.text, ref.index, color, ref.source_page))
             if text or highlights:
-                pages.append(PageText(ref.index, text, highlights))
-        return DocumentText(item.id, item.name, pages)
+                pages.append(PageText(ref.index, text, highlights, ref.source_page))
+        return DocumentText(item.id, item.name, pages, item.file_type)
 
     def _legacy_highlights(self, doc_id: str, refs: list[xochitl.PageRef], files: set[str]) -> dict[int, list[Highlight]]:
         """Highlights stored by firmware 2.x in ``<id>.highlights/<page>.json``."""
-        wanted = {f"{doc_id}.highlights/{r.id}.json": r.index for r in refs}
+        wanted = {f"{doc_id}.highlights/{r.id}.json": r for r in refs}
         present = [n for n in wanted if n in files]
         if not present:
             return {}
@@ -623,10 +818,13 @@ class Library:
                 groups = json.loads(data).get("highlights", [])
             except (ValueError, AttributeError):
                 continue
+            ref = wanted[name]
             for group in groups:
                 for hl in group if isinstance(group, list) else [group]:
                     if isinstance(hl, dict) and hl.get("text"):
-                        out.setdefault(wanted[name], []).append(Highlight(hl["text"], wanted[name]))
+                        out.setdefault(ref.index, []).append(
+                            Highlight(hl["text"], ref.index, source_page=ref.source_page)
+                        )
         return out
 
     # ------------------------------------------------------------------
@@ -652,16 +850,28 @@ class Library:
         self._check_parent(parent, allow_trash=True)
         records = self._records()
         changes = []
-        for item_id in item_ids:
+        for item_id in dict.fromkeys(item_ids):
             rec = records.get(item_id)
             if rec is None:
                 raise NotFound(f"no document or folder with id {item_id!r}")
             if parent != xochitl.TRASH and self._is_descendant(parent, item_id):
                 raise InvalidRequest("cannot move a folder into itself")
-            meta = xochitl.updated_metadata(rec.metadata, parent=parent)
-            changes.append(DocChange(item_id, write={xochitl.metadata_name(item_id): xochitl.dumps(meta)}))
+            changes.append(DocChange(item_id, patch={
+                xochitl.metadata_name(item_id): lambda meta: xochitl.updated_metadata(meta, parent=parent),
+            }))
         self.storage.apply(changes)
         return [self.get(c.doc_id) for c in changes]
+
+
+@dataclass
+class RenderedPage:
+    index: int
+    data: bytes
+    media_type: str
+    #: The tablet's page height in pixels for this page (1872 on a reMarkable 2).
+    page_height: int
+    #: True when the page was cut short by ``max_height``.
+    truncated: bool
 
 
 def _sort_key(item: Item) -> tuple:
@@ -676,6 +886,37 @@ def _looks_like_uuid(value: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def validate_upload(data: bytes, filename: str, *, max_unpacked: int = DEFAULT_MAX_UNPACKED) -> str:
+    """Check that ``data`` can be uploaded as ``filename``; return its extension.
+
+    Runs every check the upload itself would fail on, so callers can validate
+    before creating destination folders.
+    """
+    ext = PurePosixPath(filename).suffix.lower().lstrip(".")
+    if ext in ("rmdoc", "zip"):
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(data))
+        except zipfile.BadZipFile as exc:
+            raise InvalidRequest("not a valid .rmdoc/.zip archive") from exc
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        if len(infos) > MAX_ARCHIVE_ENTRIES:
+            raise InvalidRequest(f"archive has more than {MAX_ARCHIVE_ENTRIES} files")
+        if sum(i.file_size for i in infos) > max_unpacked:
+            raise InvalidRequest(f"archive unpacks to more than {max_unpacked // (1024 * 1024)} MB")
+        if len({xochitl.doc_id_of(i.filename) for i in infos if i.filename.endswith(".content")}) != 1:
+            raise InvalidRequest("archive must contain exactly one <id>.content file")
+        return ext
+    if ext not in xochitl.SOURCE_EXTENSIONS:
+        raise InvalidRequest(f"unsupported file type .{ext}: upload a PDF, EPUB or .rmdoc")
+    _check_magic(data, ext)
+    if ext == "pdf":
+        try:
+            rmpdf.page_count(data)
+        except Exception as exc:  # noqa: BLE001 - pypdf raises many types
+            raise InvalidRequest(f"this PDF could not be read: {exc}") from exc
+    return ext
 
 
 def _check_magic(data: bytes, ext: str) -> None:
